@@ -2,7 +2,7 @@ import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import axios from 'axios';
 import {
   Input, Button, Table, Tabs, Modal, message, Form, Typography, Space, Spin, Tooltip,
-  Popconfirm, Select, Checkbox, Switch, Tag, Badge, Card, Divider, Row, Col, Segmented,
+  Popconfirm, Select, Checkbox, Switch, Tag, Badge, Card, Divider, Row, Col, Segmented, Popover,
 } from 'antd';
 import {
   DatabaseOutlined, TableOutlined, PlayCircleOutlined,
@@ -13,7 +13,15 @@ import {
   ClearOutlined, SettingOutlined, AppstoreAddOutlined,
   PlusCircleOutlined, CheckCircleOutlined, LinkOutlined,
   HistoryOutlined, ArrowUpOutlined, ArrowDownOutlined,
+  DashboardOutlined, SwapOutlined,
 } from '@ant-design/icons';
+
+import AuthPortal from './components/AuthPortal';
+import UserHeader from './components/UserHeader';
+import SavedConnectionsModal from './components/SavedConnectionsModal';
+import DatabaseSlotsHub from './components/DatabaseSlotsHub';
+import DatabaseMetricsDashboard from './components/DatabaseMetricsDashboard';
+import { parseDatabaseUri } from './utils/dbUriParser';
 
 const { TextArea } = Input;
 const { Text, Title } = Typography;
@@ -30,8 +38,8 @@ export default function App() {
   const [connectionForm] = Form.useForm();
   const [isConnected, setIsConnected] = useState(false);
   const [tables, setTables] = useState([]);
-  const [activeTab, setActiveTab] = useState('query');
-  const [openTabs, setOpenTabs] = useState(['query']);
+  const [activeTab, setActiveTab] = useState('metrics');
+  const [openTabs, setOpenTabs] = useState(['metrics', 'query']);
   const [querySQL, setQuerySQL] = useState('SELECT * FROM your_table LIMIT 10;');
   const [queryResult, setQueryResult] = useState({ columns: [], data: [], rowCount: 0 });
   const [queryTime, setQueryTime] = useState(null);
@@ -112,6 +120,132 @@ export default function App() {
     return false;
   });
 
+  // User Authentication & Multi-Tenant Isolated Storage State
+  const [currentUser, setCurrentUser] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [savedDbConnections, setSavedDbConnections] = useState([]);
+  const [savedConnectionsModalVisible, setSavedConnectionsModalVisible] = useState(false);
+  const [saveToAccount, setSaveToAccount] = useState(true);
+  const [connectionLabel, setConnectionLabel] = useState('');
+
+  // Setup Axios interceptor & verify active user session
+  useEffect(() => {
+    const interceptor = axios.interceptors.request.use((config) => {
+      const token = localStorage.getItem('appdb_jwt_token');
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
+      return config;
+    });
+
+    const checkUser = async () => {
+      const token = localStorage.getItem('appdb_jwt_token');
+      if (!token) {
+        setAuthLoading(false);
+        return;
+      }
+      try {
+        const res = await axios.get('/api/auth/me');
+        if (res.data.success && res.data.user) {
+          setCurrentUser(res.data.user);
+          fetchUserConnections();
+        } else {
+          localStorage.removeItem('appdb_jwt_token');
+          setCurrentUser(null);
+        }
+      } catch (err) {
+        localStorage.removeItem('appdb_jwt_token');
+        setCurrentUser(null);
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+
+    checkUser();
+
+    return () => {
+      axios.interceptors.request.eject(interceptor);
+    };
+  }, []);
+
+  const fetchUserConnections = async () => {
+    try {
+      const res = await axios.get('/api/user/connections');
+      if (res.data.success) {
+        setSavedDbConnections(res.data.connections || []);
+      }
+    } catch (err) {
+      console.error('Failed to fetch user connections:', err);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await axios.post('/api/auth/logout');
+    } catch (e) { /* ignore */ }
+    localStorage.removeItem('appdb_jwt_token');
+    localStorage.removeItem('appdb_session');
+    sessionStorage.removeItem('appdb_toast_dismissed');
+    sessionStorage.setItem('appdb_logout_toast', 'true');
+    setCurrentUser(null);
+    setIsConnected(false);
+    message.info('Anda telah keluar dari akun.');
+  };
+
+  const handleAuthSuccess = (userData, token) => {
+    setCurrentUser(userData);
+    fetchUserConnections();
+  };
+
+  const handleSelectSavedConnection = async (savedConn) => {
+    try {
+      const res = await axios.get(`/api/user/connections/${savedConn.id}/credentials`);
+      if (res.data.success) {
+        const creds = res.data.credentials;
+        const uri = creds.connection_string;
+        const parsed = uri ? parseDatabaseUri(uri) : null;
+
+        const connectPayload = {
+          ...creds,
+          ...(parsed || {}),
+          connection_string: uri || creds.connection_string || undefined,
+        };
+
+        if (uri) {
+          setConnString(uri);
+          setConnectionMode('uri');
+        } else {
+          setConnectionMode('manual');
+        }
+
+        connectionForm.setFieldsValue({
+          host: connectPayload.host,
+          port: connectPayload.port,
+          database: connectPayload.database,
+          user: connectPayload.user,
+          password: connectPayload.password,
+        });
+
+        await handleConnect(connectPayload);
+      }
+    } catch (err) {
+      console.error('Connection error:', err);
+      message.error(err.response?.data?.error || err.message || 'Gagal terhubung ke database');
+    }
+  };
+
+  const handleDeleteSavedConnection = async (connId) => {
+    try {
+      const res = await axios.delete(`/api/user/connections/${connId}`);
+      if (res.data.success) {
+        message.success('Koneksi berhasil dihapus dari akun Anda.');
+        fetchUserConnections();
+      }
+    } catch (err) {
+      message.error('Gagal menghapus koneksi');
+    }
+  };
+
   // Modals state
   const [newTableModalVisible, setNewTableModalVisible] = useState(false);
   const [addColumnModalVisible, setAddColumnModalVisible] = useState(false);
@@ -119,6 +253,11 @@ export default function App() {
   const [addRowModalVisible, setAddRowModalVisible] = useState(false);
   const [editRowModalVisible, setEditRowModalVisible] = useState(false);
   const [editingRowRecord, setEditingRowRecord] = useState(null);
+  const [renameColumnModalVisible, setRenameColumnModalVisible] = useState(false);
+  const [renamingColumn, setRenamingColumn] = useState({ tableName: '', oldName: '' });
+  const [renameLoading, setRenameLoading] = useState(false);
+  const [inlineEditingCol, setInlineEditingCol] = useState(null);
+  const [inlineColNewName, setInlineColNewName] = useState('');
 
   // New table builder state
   const [newTableName, setNewTableName] = useState('');
@@ -138,44 +277,17 @@ export default function App() {
   
   // Parse connection string helper with newline and whitespace handling
   const parseConnectionString = useCallback((rawStr) => {
-    try {
-      let str = (rawStr || '').replace(/[\r\n\t]/g, '').trim();
-      if (!str) return null;
-      if (!str.includes('://')) {
-        str = 'postgresql://' + str;
-      }
-      const url = new URL(str);
-      const port = url.port || (url.protocol.startsWith('postgres') ? '5432' : '3001');
-      const database = decodeURIComponent(url.pathname.replace(/^\//, ''));
-      const user = decodeURIComponent(url.username || '');
-      const password = decodeURIComponent(url.password || '');
-      const host = url.hostname || '';
-      if (!host && !database) return null;
-      return { host, port, database, user, password };
-    } catch {
-      return null;
-    }
+    return parseDatabaseUri(rawStr);
   }, []);
 
   const [parsedPreview, setParsedPreview] = useState(() => {
     const initialUri = 'postgresql://uazuSleyutH953G5A.jkt1_003:b56aabd50b51c19d747f830f@pgsql-dbas-jkt1-003.sumobase.my.id:6432/db658b2889efac70aa';
-    try {
-      const url = new URL(initialUri);
-      return {
-        host: url.hostname || '',
-        port: url.port || '6432',
-        database: decodeURIComponent(url.pathname.replace(/^\//, '')),
-        user: decodeURIComponent(url.username || ''),
-        password: decodeURIComponent(url.password || ''),
-      };
-    } catch {
-      return null;
-    }
+    return parseDatabaseUri(initialUri);
   });
 
   const handleConnStringInput = (val) => {
     setConnString(val);
-    const parsed = parseConnectionString(val);
+    const parsed = parseDatabaseUri(val);
     if (parsed) {
       setParsedPreview(parsed);
       connectionForm.setFieldsValue(parsed);
@@ -186,7 +298,7 @@ export default function App() {
 
   const handleSelectPreset = (uri) => {
     setConnString(uri);
-    const parsed = parseConnectionString(uri);
+    const parsed = parseDatabaseUri(uri);
     if (parsed) {
       setParsedPreview(parsed);
       connectionForm.setFieldsValue(parsed);
@@ -195,13 +307,17 @@ export default function App() {
   };
 
   const handleConnectWithUri = () => {
-    const parsed = parseConnectionString(connString);
+    const parsed = parseDatabaseUri(connString);
     if (!parsed || !parsed.host || !parsed.database) {
       message.error('Format Connection String tidak valid. Contoh: postgresql://user:pass@host:5432/dbname');
       return;
     }
+    const payload = {
+      ...parsed,
+      connection_string: connString,
+    };
     connectionForm.setFieldsValue(parsed);
-    handleConnect(parsed);
+    handleConnect(payload);
   };
 
   // History operations
@@ -247,6 +363,7 @@ export default function App() {
   const [addColumnForm] = Form.useForm();
   const [addRowForm] = Form.useForm();
   const [editRowForm] = Form.useForm();
+  const [renameColumnForm] = Form.useForm();
 
   const queryInputRef = useRef(null);
   const searchInputRef = useRef(null);
@@ -267,7 +384,11 @@ export default function App() {
     setLoading(true);
     setConnectingStatus('Menghubungkan ke server...');
     try {
-      const res = await axios.post(`${API_URL}/connect`, values);
+      const payload = {
+        ...values,
+        connection_string: values.connection_string || connString || undefined,
+      };
+      const res = await axios.post(`${API_URL}/connect`, payload);
       if (res.data.success) {
         setCredentials(values);
         setTables(res.data.tables);
@@ -278,13 +399,13 @@ export default function App() {
 
         const nextOpenTabs = (initialTabs && Array.isArray(initialTabs) && initialTabs.length > 0)
           ? initialTabs
-          : (res.data.tables.length > 0 ? ['query', res.data.tables[0]] : ['query']);
-        const nextActiveTab = initialActiveTab || (res.data.tables.length > 0 ? res.data.tables[0] : 'query');
+          : ['metrics', 'query'];
+        const nextActiveTab = initialActiveTab || 'metrics';
 
         setOpenTabs(nextOpenTabs);
         setActiveTab(nextActiveTab);
 
-        if (nextActiveTab !== 'query') {
+        if (nextActiveTab !== 'query' && nextActiveTab !== 'metrics') {
           fetchTableData(nextActiveTab, values);
           fetchTableStructure(nextActiveTab, values);
         }
@@ -322,6 +443,23 @@ export default function App() {
           } catch { /* ignore */ }
           return updated;
         });
+
+        // Save to user's isolated database storage with AES-256 encryption
+        if (currentUser && saveToAccount) {
+          try {
+            const label = connectionLabel.trim() || `${values.database}@${values.host}`;
+            axios.post('/api/user/connections', {
+              name: label,
+              type: values.host === 'localhost' && values.database === 'demo' ? 'sqlite' : 'postgres',
+              host: values.host,
+              port: values.port,
+              database_name: values.database,
+              username: values.user,
+              password: values.password,
+              connection_string: connString || null,
+            }).then(() => fetchUserConnections()).catch(() => {});
+          } catch (e) { /* ignore */ }
+        }
       }
     } catch (error) {
       message.error(error.response?.data?.error || 'Koneksi gagal');
@@ -395,8 +533,8 @@ export default function App() {
     setTables([]);
     setTableDataCache({});
     setTableStructure({});
-    setOpenTabs(['query']);
-    setActiveTab('query');
+    setOpenTabs(['metrics', 'query']);
+    setActiveTab('metrics');
     message.info('Koneksi terputus');
   };
 
@@ -444,7 +582,7 @@ export default function App() {
   // ---------- TAB CHANGE ----------
   const handleTabChange = useCallback((newTab) => {
     setActiveTab(newTab);
-    if (newTab !== 'query') {
+    if (newTab !== 'query' && newTab !== 'metrics') {
       if (!tableDataCache[newTab]) fetchTableData(newTab);
       if (!tableStructure[newTab]) fetchTableStructure(newTab);
     }
@@ -618,6 +756,70 @@ export default function App() {
     } catch (err) {
       message.error(err.response?.data?.error || 'Gagal menghapus kolom');
     }
+  };
+
+  // ---------- RENAME COLUMN (Klik Edit Langsung) ----------
+  const handleRenameColumnSubmit = async (tableName, oldColumnName, newColumnName) => {
+    const targetTable = tableName || activeTab;
+    if (!targetTable || targetTable === 'query' || targetTable === 'metrics') return;
+
+    const trimmedNew = (newColumnName || '').trim();
+    if (!trimmedNew) {
+      message.warning('Nama kolom baru tidak boleh kosong');
+      return;
+    }
+    if (trimmedNew === oldColumnName) {
+      message.info('Nama kolom tidak berubah');
+      setRenameColumnModalVisible(false);
+      setInlineEditingCol(null);
+      return;
+    }
+
+    setRenameLoading(true);
+    try {
+      const res = await axios.post(`${API_URL}/table/rename-column`, {
+        ...credentials,
+        tableName: targetTable,
+        oldColumnName,
+        newColumnName: trimmedNew,
+      });
+
+      if (res.data.success) {
+        message.success(`Nama kolom "${oldColumnName}" berhasil diubah menjadi "${trimmedNew}"`);
+
+        // Update customColumnOrder if present
+        setCustomColumnOrder(prev => {
+          const currentCols = prev[targetTable] || [];
+          const updatedCols = currentCols.map(c => c === oldColumnName ? trimmedNew : c);
+          return { ...prev, [targetTable]: updatedCols };
+        });
+
+        // Update hiddenColumns if present
+        setHiddenColumns(prev => {
+          const currentHidden = prev[targetTable] || [];
+          const updatedHidden = currentHidden.map(c => c === oldColumnName ? trimmedNew : c);
+          return { ...prev, [targetTable]: updatedHidden };
+        });
+
+        setRenameColumnModalVisible(false);
+        setInlineEditingCol(null);
+        renameColumnForm.resetFields();
+
+        // Refresh structure and data
+        fetchTableStructure(targetTable);
+        fetchTableData(targetTable);
+      }
+    } catch (err) {
+      message.error(err.response?.data?.error || 'Gagal mengubah nama kolom');
+    } finally {
+      setRenameLoading(false);
+    }
+  };
+
+  const openRenameColumnModal = (tableName, columnName) => {
+    setRenamingColumn({ tableName, oldName: columnName });
+    renameColumnForm.setFieldsValue({ newColumnName: columnName });
+    setRenameColumnModalVisible(true);
   };
 
   // ---------- INSERT ROW ----------
@@ -930,27 +1132,40 @@ export default function App() {
 
   // ---------- TAB CLOSE ----------
   const handleTabEdit = (targetKey, action) => {
-    if (action === 'remove' && targetKey !== 'query') {
+    if (action === 'remove' && targetKey !== 'query' && targetKey !== 'metrics') {
       const newTabs = openTabs.filter(t => t !== targetKey);
       setOpenTabs(newTabs);
       if (activeTab === targetKey) {
-        setActiveTab(newTabs[newTabs.length - 1] || 'query');
+        setActiveTab(newTabs[newTabs.length - 1] || 'metrics');
       }
     }
   };
 
+  // ---------- RENDER: AUTHENTICATION CHECK ----------
+  if (authLoading) {
+    return (
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: '#f8fafc' }}>
+        <Spin size="large" tip="Memuat akun..." />
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return <AuthPortal onAuthSuccess={handleAuthSuccess} />;
+  }
+
   // ---------- RENDER: RESTORING SESSION SPLASH ----------
   if (isRestoringSession) {
     return (
-      <div className="connection-page">
+      <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '100vh', background: '#f8fafc' }}>
         <div className="session-restore-splash">
           <div className="restore-logo-wrapper">
             <img src="/logo.png" alt="ai-jogja" className="restore-logo-img" />
           </div>
-          <h3 style={{ color: '#fff', marginTop: 20, marginBottom: 8, fontSize: 18, fontWeight: 600 }}>
+          <h3 style={{ color: '#0f172a', marginTop: 20, marginBottom: 8, fontSize: 18, fontWeight: 700 }}>
             Menghubungkan Kembali ke Database...
           </h3>
-          <p style={{ color: '#8b8fa3', fontSize: 13, margin: 0 }}>
+          <p style={{ color: '#64748b', fontSize: 13, margin: 0 }}>
             Memulihkan sesi aktif dan tab kerja Anda
           </p>
         </div>
@@ -958,224 +1173,16 @@ export default function App() {
     );
   }
 
-  // ---------- RENDER: CONNECTION PAGE ----------
+  // ---------- RENDER: DATABASE SLOTS HUB ----------
   if (!isConnected) {
     return (
-      <div className="connection-page">
-        <div className="connection-card">
-          <div className="connection-logo">
-            <div className="connection-logo-brand">
-              <img src="/logo.png" alt="ai-jogja Logo" className="connection-logo-img" />
-              <div className="connection-logo-title-group">
-                <span className="connection-logo-text">App Database</span>
-              </div>
-            </div>
-          </div>
-          <p className="connection-subtitle">Connect to your database</p>
-
-          {/* Mode Switcher */}
-          <Segmented
-            className="conn-mode-segmented"
-            block
-            value={connectionMode}
-            onChange={setConnectionMode}
-            options={[
-              { label: <span><LinkOutlined /> Connection String</span>, value: 'uri' },
-              { label: <span><SettingOutlined /> Manual Parameters</span>, value: 'manual' },
-            ]}
-          />
-
-          {/* Quick Presets */}
-          <div className="presets-container">
-            <span style={{ fontSize: 11, color: '#8b8fa3' }}>Presets:</span>
-            <Button
-              className="preset-chip"
-              size="small"
-              onClick={() => handleSelectPreset('postgresql://uazuSleyutH953G5A.jkt1_003:b56aabd50b51c19d747f830f@pgsql-dbas-jkt1-003.sumobase.my.id:6432/db658b2889efac70aa')}
-            >
-              🐘 SumoPod PG
-            </Button>
-            <Button
-              className="preset-chip"
-              size="small"
-              onClick={() => handleSelectPreset('postgresql://demo:demo@localhost:3001/demo')}
-            >
-              ⚡ Demo SQLite (Local)
-            </Button>
-          </div>
-
-          {/* MODE 1: Connection String */}
-          {connectionMode === 'uri' ? (
-            <div>
-              <div style={{ marginBottom: 6 }}>
-                <Text strong style={{ fontSize: 12 }}>Connection URI / URL</Text>
-              </div>
-              <TextArea
-                rows={3}
-                value={connString}
-                onChange={(e) => handleConnStringInput(e.target.value)}
-                placeholder="postgresql://username:password@host:port/database"
-                style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12 }}
-              />
-
-              {parsedPreview ? (
-                <div className="parsed-preview-box">
-                  <div className="parsed-preview-header">
-                    <span>Parsed Components (Auto-Split)</span>
-                    <Tag color="purple" style={{ marginRight: 0, fontSize: 10 }}>Valid URI</Tag>
-                  </div>
-                  <div className="parsed-preview-grid">
-                    <div className="parsed-preview-item">
-                      <span className="parsed-preview-label">Host</span>
-                      <span className="parsed-preview-val">{parsedPreview.host || '—'}</span>
-                    </div>
-                    <div className="parsed-preview-item">
-                      <span className="parsed-preview-label">Port</span>
-                      <span className="parsed-preview-val">{parsedPreview.port || '5432'}</span>
-                    </div>
-                    <div className="parsed-preview-item">
-                      <span className="parsed-preview-label">Database</span>
-                      <span className="parsed-preview-val">{parsedPreview.database || '—'}</span>
-                    </div>
-                    <div className="parsed-preview-item">
-                      <span className="parsed-preview-label">Username</span>
-                      <span className="parsed-preview-val">{parsedPreview.user || '—'}</span>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div style={{ marginTop: 8, marginBottom: 16, color: '#e17055', fontSize: 11 }}>
-                  ⚠️ Format URI belum valid. Contoh: <code>postgresql://user:pass@host:5432/dbname</code>
-                </div>
-              )}
-
-              <Button
-                type="primary"
-                loading={loading}
-                block
-                size="large"
-                icon={<ThunderboltOutlined />}
-                onClick={handleConnectWithUri}
-                style={{ height: 44, fontWeight: 600, marginTop: 4 }}
-              >
-                {loading ? connectingStatus || 'Menghubungkan...' : 'Parse & Connect'}
-              </Button>
-            </div>
-          ) : (
-            /* MODE 2: Manual Parameters */
-            <Form
-              form={connectionForm}
-              layout="vertical"
-              onFinish={handleConnect}
-              requiredMark={false}
-              size="large"
-            >
-              <Form.Item label="Host" name="host" rules={[{ required: true, message: 'Host diperlukan' }]}>
-                <Input placeholder="localhost" prefix={<span style={{ color: '#5c6070', fontSize: 12 }}>🖥</span>} />
-              </Form.Item>
-              <div style={{ display: 'flex', gap: 12 }}>
-                <Form.Item label="Port" name="port" rules={[{ required: true, message: 'Port diperlukan' }]} style={{ flex: 1 }}>
-                  <Input placeholder="5432" />
-                </Form.Item>
-                <Form.Item label="Database" name="database" rules={[{ required: true, message: 'Database diperlukan' }]} style={{ flex: 2 }}>
-                  <Input placeholder="my_database" />
-                </Form.Item>
-              </div>
-              <Form.Item label="Username" name="user" rules={[{ required: true, message: 'Username diperlukan' }]}>
-                <Input placeholder="postgres" />
-              </Form.Item>
-              <Form.Item label="Password" name="password" rules={[{ required: true, message: 'Password diperlukan' }]}>
-                <Input.Password placeholder="••••••••" />
-              </Form.Item>
-              <Form.Item style={{ marginBottom: 0, marginTop: 8 }}>
-                <Button
-                  type="primary"
-                  htmlType="submit"
-                  loading={loading}
-                  block
-                  size="large"
-                  icon={<ThunderboltOutlined />}
-                  style={{ height: 44, fontWeight: 600 }}
-                >
-                  {loading ? connectingStatus || 'Menghubungkan...' : 'Connect'}
-                </Button>
-              </Form.Item>
-            </Form>
-          )}
-
-          {/* Remember Login Checkbox */}
-          <div style={{ marginTop: 14, marginBottom: 12 }}>
-            <Checkbox
-              checked={rememberLogin}
-              onChange={(e) => {
-                setRememberLogin(e.target.checked);
-                try {
-                  localStorage.setItem('appdb_remember', e.target.checked ? 'true' : 'false');
-                  if (!e.target.checked) {
-                    localStorage.removeItem('appdb_session');
-                  }
-                } catch { /* ignore */ }
-              }}
-            >
-              <span style={{ fontSize: 12, color: '#a29bfe' }}>
-                Ingat data login & simpan sesi (Auto-reconnect saat browser di-refresh)
-              </span>
-            </Checkbox>
-          </div>
-
-          {/* Saved History List */}
-          {savedHistory.length > 0 && (
-            <div className="history-box">
-              <div className="history-header">
-                <span style={{ display: 'flex', alignItems: 'center', gap: 5 }}>
-                  <HistoryOutlined style={{ color: '#6C5CE7' }} />
-                  Riwayat Koneksi Tersimpan ({savedHistory.length})
-                </span>
-                <Button
-                  type="link"
-                  size="small"
-                  onClick={clearAllHistory}
-                  style={{ padding: 0, fontSize: 10, color: '#8b8fa3' }}
-                >
-                  Bersihkan
-                </Button>
-              </div>
-              <div className="history-list">
-                {savedHistory.map((hist) => (
-                  <div
-                    key={hist.id}
-                    className="history-item-row"
-                    onClick={() => handleApplyHistory(hist)}
-                  >
-                    <div className="history-item-title">
-                      <DatabaseOutlined style={{ fontSize: 12, color: '#a29bfe' }} />
-                      <span>{hist.title}</span>
-                    </div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span className="history-item-meta">
-                        {hist.user} • {new Date(hist.timestamp).toLocaleDateString()}
-                      </span>
-                      <Button
-                        type="text"
-                        size="small"
-                        icon={<DeleteOutlined style={{ fontSize: 10, color: '#e17055' }} />}
-                        onClick={(e) => deleteHistoryItem(hist.id, e)}
-                        style={{ height: 20, width: 20, padding: 0 }}
-                      />
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Footer Branding */}
-          <div className="login-footer-attribution">
-            <span className="footer-ai-jogja-badge">AI-JOGJA</span>
-            <span className="footer-creator-text">Dibuat oleh <strong>Fajar Wahyudi</strong></span>
-          </div>
-        </div>
-      </div>
+      <DatabaseSlotsHub
+        user={currentUser}
+        slots={savedDbConnections}
+        onRefreshSlots={fetchUserConnections}
+        onSelectSlot={handleSelectSavedConnection}
+        onLogout={handleLogout}
+      />
     );
   }
 
@@ -1267,49 +1274,123 @@ export default function App() {
         })
       : [];
 
-    // Construct columns for data table with Move Left / Right buttons & Edit/Delete actions
+    // Construct columns for data table with Move Left / Right buttons & Direct Edit Column actions
     const tableDisplayColumns = [
-      ...visibleColumnKeys.map((colKey, colIdx) => ({
-        title: (
-          <div className="col-header-container">
-            <span>{colKey}</span>
-            <span style={{ display: 'inline-flex', gap: 2, marginLeft: 'auto' }}>
-              <Tooltip title="Pindahkan kolom ke kiri">
-                <Button
-                  className="col-move-btn"
-                  icon={<ArrowLeftOutlined />}
-                  disabled={colIdx === 0}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    moveColumn(tableName, colKey, 'left');
+      ...visibleColumnKeys.map((colKey, colIdx) => {
+        const isEditingThis = inlineEditingCol === `${tableName}.${colKey}`;
+        return {
+          title: (
+            <div className="col-header-container">
+              <span
+                style={{ cursor: 'pointer', fontWeight: 600 }}
+                title="Klik dua kali atau gunakan ikon edit untuk mengubah nama kolom"
+                onDoubleClick={() => {
+                  setInlineEditingCol(`${tableName}.${colKey}`);
+                  setInlineColNewName(colKey);
+                }}
+              >
+                {colKey}
+              </span>
+              <span style={{ display: 'inline-flex', gap: 2, marginLeft: 'auto', alignItems: 'center' }}>
+                <Popover
+                  content={
+                    <div style={{ width: 230, padding: 4 }}>
+                      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4, color: '#0f172a' }}>
+                        ✏️ Ubah Nama Kolom
+                      </div>
+                      <div style={{ fontSize: 11, color: '#64748b', marginBottom: 8 }}>
+                        Kolom: <Tag color="purple">{colKey}</Tag>
+                      </div>
+                      <Input
+                        size="small"
+                        value={inlineColNewName}
+                        onChange={(e) => setInlineColNewName(e.target.value)}
+                        onPressEnter={() => handleRenameColumnSubmit(tableName, colKey, inlineColNewName)}
+                        placeholder="Nama kolom baru..."
+                        autoFocus
+                        style={{ marginBottom: 10 }}
+                      />
+                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
+                        <Button
+                          size="small"
+                          onClick={() => setInlineEditingCol(null)}
+                        >
+                          Batal
+                        </Button>
+                        <Button
+                          size="small"
+                          type="primary"
+                          loading={renameLoading}
+                          onClick={() => handleRenameColumnSubmit(tableName, colKey, inlineColNewName)}
+                          style={{ background: '#7c3aed', borderColor: '#7c3aed' }}
+                        >
+                          Simpan
+                        </Button>
+                      </div>
+                    </div>
+                  }
+                  title={null}
+                  trigger="click"
+                  open={isEditingThis}
+                  onOpenChange={(open) => {
+                    if (open) {
+                      setInlineEditingCol(`${tableName}.${colKey}`);
+                      setInlineColNewName(colKey);
+                    } else {
+                      setInlineEditingCol(null);
+                    }
                   }}
-                />
-              </Tooltip>
-              <Tooltip title="Pindahkan kolom ke kanan">
-                <Button
-                  className="col-move-btn"
-                  icon={<ArrowRightOutlined />}
-                  disabled={colIdx === visibleColumnKeys.length - 1}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    moveColumn(tableName, colKey, 'right');
-                  }}
-                />
-              </Tooltip>
-            </span>
-          </div>
-        ),
-        dataIndex: colKey,
-        key: colKey,
-        ellipsis: true,
-        width: 180,
+                  placement="bottomRight"
+                >
+                  <Tooltip title="Klik Edit Langsung (Ubah nama kolom)">
+                    <Button
+                      className="col-move-btn col-edit-btn"
+                      icon={<EditOutlined style={{ color: '#7c3aed' }} />}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setInlineEditingCol(`${tableName}.${colKey}`);
+                        setInlineColNewName(colKey);
+                      }}
+                    />
+                  </Tooltip>
+                </Popover>
+                <Tooltip title="Pindahkan kolom ke kiri">
+                  <Button
+                    className="col-move-btn"
+                    icon={<ArrowLeftOutlined />}
+                    disabled={colIdx === 0}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      moveColumn(tableName, colKey, 'left');
+                    }}
+                  />
+                </Tooltip>
+                <Tooltip title="Pindahkan kolom ke kanan">
+                  <Button
+                    className="col-move-btn"
+                    icon={<ArrowRightOutlined />}
+                    disabled={colIdx === visibleColumnKeys.length - 1}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      moveColumn(tableName, colKey, 'right');
+                    }}
+                  />
+                </Tooltip>
+              </span>
+            </div>
+          ),
+          dataIndex: colKey,
+          key: colKey,
+          ellipsis: true,
+          width: 180,
         render: (value) => {
           if (value === null) return <span style={{ color: '#5c6070', fontStyle: 'italic' }}>NULL</span>;
           if (typeof value === 'boolean') return <span style={{ color: value ? '#00b894' : '#e17055' }}>{String(value)}</span>;
           if (typeof value === 'object') return <span style={{ color: '#fdcb6e' }}>{JSON.stringify(value)}</span>;
           return String(value);
         },
-      })),
+      };
+    }),
       {
         title: 'Actions',
         key: '__actions__',
@@ -1443,7 +1524,7 @@ export default function App() {
 
           <div className="toolbar-group">
             <span style={{ fontSize: 11, color: '#8b8fa3' }}>
-              💡 Gunakan tombol <b>⬅ ➡</b> di judul kolom untuk memindahkan urutan kolom
+              💡 Gunakan tombol <b>✏️ Edit</b> di judul kolom untuk ubah nama langsung, atau <b>⬅ ➡</b> untuk memindahkan urutan
             </span>
           </div>
         </div>
@@ -1511,9 +1592,17 @@ export default function App() {
                 {
                   title: 'Action',
                   key: 'action',
-                  width: 130,
+                  width: 155,
                   render: (_, record, sIdx) => (
                     <Space size={2}>
+                      <Tooltip title="Ubah nama kolom (Rename)">
+                        <Button
+                          size="small"
+                          type="text"
+                          icon={<EditOutlined style={{ color: '#7c3aed' }} />}
+                          onClick={() => openRenameColumnModal(tableName, record.column_name)}
+                        />
+                      </Tooltip>
                       <Tooltip title="Geser kolom ke atas / kiri">
                         <Button
                           size="small"
@@ -1590,12 +1679,34 @@ export default function App() {
 
   // ---------- TAB ITEMS ----------
   const tabItems = openTabs.map(tabKey => {
+    if (tabKey === 'metrics') {
+      return {
+        key: 'metrics',
+        label: (
+          <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <DashboardOutlined style={{ fontSize: 13, color: '#4f46e5' }} />
+            Ringkasan & Metrik
+          </span>
+        ),
+        children: (
+          <DatabaseMetricsDashboard
+            credentials={credentials}
+            onNavigateToQuery={() => {
+              if (!openTabs.includes('query')) setOpenTabs(prev => [...prev, 'query']);
+              setActiveTab('query');
+            }}
+            onOpenTable={(tableName) => handleTableClick(tableName)}
+          />
+        ),
+        closable: false,
+      };
+    }
     if (tabKey === 'query') {
       return {
         key: 'query',
         label: (
           <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <CodeOutlined style={{ fontSize: 13 }} />
+            <CodeOutlined style={{ fontSize: 13, color: '#0891b2' }} />
             Query
           </span>
         ),
@@ -1617,7 +1728,7 @@ export default function App() {
   });
 
   // Active table structure for Add/Edit row modals
-  const currentActiveStructure = (activeTab && activeTab !== 'query')
+  const currentActiveStructure = (activeTab && activeTab !== 'query' && activeTab !== 'metrics')
     ? (tableStructure[activeTab] || [])
     : [];
 
@@ -1636,7 +1747,22 @@ export default function App() {
           <span>{credentials?.database}@{credentials?.host}</span>
         </div>
         <div className="header-actions">
+          <Tooltip title="Kembali ke Dashboard Pilihan Slot Database">
+            <Button
+              size="small"
+              icon={<SwapOutlined style={{ color: '#4f46e5' }} />}
+              onClick={() => setIsConnected(false)}
+              style={{ borderRadius: 6, fontWeight: 500 }}
+            >
+              Ganti Database
+            </Button>
+          </Tooltip>
           <span className="header-shortcut-hint">Ctrl+P Search</span>
+          <UserHeader
+            user={currentUser}
+            onLogout={handleLogout}
+            savedConnectionsCount={savedDbConnections.length}
+          />
           <Button
             className="disconnect-btn"
             size="small"
@@ -1652,10 +1778,36 @@ export default function App() {
       <div className="app-body">
         {/* Sidebar */}
         <div className="app-sidebar">
+          {/* Quick Nav Links */}
+          <div className="sidebar-quick-nav">
+            <div
+              className={`sidebar-nav-item ${activeTab === 'metrics' ? 'active' : ''}`}
+              onClick={() => {
+                if (!openTabs.includes('metrics')) setOpenTabs(prev => ['metrics', ...prev]);
+                setActiveTab('metrics');
+              }}
+            >
+              <DashboardOutlined style={{ color: '#4f46e5', fontSize: 14 }} />
+              <span>Ringkasan & Metrik</span>
+            </div>
+            <div
+              className={`sidebar-nav-item ${activeTab === 'query' ? 'active' : ''}`}
+              onClick={() => {
+                if (!openTabs.includes('query')) setOpenTabs(prev => [...prev, 'query']);
+                setActiveTab('query');
+              }}
+            >
+              <CodeOutlined style={{ color: '#0891b2', fontSize: 14 }} />
+              <span>Query Editor</span>
+            </div>
+          </div>
+
+          <Divider style={{ margin: '8px 0', borderColor: '#f1f5f9' }} />
+
           <div className="sidebar-search">
             <Input
-              placeholder="Search tables..."
-              prefix={<SearchOutlined style={{ color: '#5c6070' }} />}
+              placeholder="Cari tabel..."
+              prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
               onChange={(e) => setSidebarSearch(e.target.value)}
               value={sidebarSearch}
               allowClear
@@ -1664,15 +1816,14 @@ export default function App() {
 
           <div className="sidebar-header-action">
             <div className="sidebar-section-title" style={{ padding: 0 }}>
-              TABLES
-              <span className="sidebar-table-count">{filteredSidebarTables.length}</span>
+              TABEL ({filteredSidebarTables.length})
             </div>
             <Button
               className="new-table-btn"
               icon={<PlusOutlined />}
               onClick={() => setNewTableModalVisible(true)}
             >
-              + New Table
+              + Tabel Baru
             </Button>
           </div>
 
@@ -1688,8 +1839,8 @@ export default function App() {
               </div>
             ))}
             {filteredSidebarTables.length === 0 && (
-              <div style={{ padding: '16px', color: '#5c6070', fontSize: 12, textAlign: 'center' }}>
-                No tables found
+              <div style={{ padding: '16px', color: '#94a3b8', fontSize: 12, textAlign: 'center' }}>
+                Tidak ada tabel ditemukan
               </div>
             )}
           </div>
@@ -1717,13 +1868,13 @@ export default function App() {
           <span>Connected</span>
         </div>
         <div className="status-bar-item">
-          <span>{credentials?.database === 'demo' ? 'SQLite (Demo)' : 'PostgreSQL'}</span>
+          <span>{credentials?.type ? credentials.type.toUpperCase() : (credentials?.database === 'demo' ? 'SQLITE' : 'POSTGRESQL')}</span>
         </div>
         <div className="status-bar-item">
           <span>{credentials?.host}:{credentials?.port}</span>
         </div>
         <div className="status-bar-item">
-          <span>{tables.length} tables</span>
+          <span>{tables.length} tabel</span>
         </div>
       </div>
 
@@ -1939,6 +2090,74 @@ export default function App() {
       </Modal>
 
       {/* ============================================================ */}
+      {/* MODAL 2.5: RENAME COLUMN (Klik Edit Langsung) */}
+      {/* ============================================================ */}
+      <Modal
+        title={
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <EditOutlined style={{ color: '#7c3aed', fontSize: 18 }} />
+            <span>Ubah Nama Kolom (Rename Column)</span>
+          </div>
+        }
+        open={renameColumnModalVisible}
+        onCancel={() => {
+          setRenameColumnModalVisible(false);
+          renameColumnForm.resetFields();
+        }}
+        onOk={() => renameColumnForm.submit()}
+        confirmLoading={renameLoading}
+        okText="Simpan Nama Baru"
+        cancelText="Batal"
+        okButtonProps={{ style: { background: '#7c3aed', borderColor: '#7c3aed' } }}
+        destroyOnClose
+      >
+        <div style={{ marginBottom: 16, background: '#f8fafc', padding: '10px 14px', borderRadius: 8, border: '1px solid #e2e8f0' }}>
+          <Text style={{ fontSize: 12, color: '#64748b', display: 'block', marginBottom: 4 }}>
+            Tabel: <b style={{ color: '#0f172a' }}>{renamingColumn.tableName || activeTab}</b>
+          </Text>
+          <Text style={{ fontSize: 12, color: '#64748b' }}>
+            Kolom saat ini: <Tag color="purple" style={{ fontWeight: 600 }}>{renamingColumn.oldName}</Tag>
+          </Text>
+        </div>
+        <Form
+          form={renameColumnForm}
+          layout="vertical"
+          onFinish={(values) =>
+            handleRenameColumnSubmit(
+              renamingColumn.tableName || activeTab,
+              renamingColumn.oldName,
+              values.newColumnName
+            )
+          }
+        >
+          <Form.Item
+            name="newColumnName"
+            label="Nama Kolom Baru"
+            rules={[
+              { required: true, message: 'Nama kolom baru tidak boleh kosong' },
+              {
+                validator: (_, val) => {
+                  if (val && val.trim() === renamingColumn.oldName) {
+                    return Promise.reject(new Error('Nama baru tidak boleh sama dengan nama saat ini'));
+                  }
+                  if (val && !/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(val.trim())) {
+                    return Promise.reject(new Error('Format tidak valid. Awali huruf/underscore dan gunakan karakter alfanumerik.'));
+                  }
+                  return Promise.resolve();
+                }
+              }
+            ]}
+          >
+            <Input
+              placeholder="Contoh: nip_baru, user_email, full_name..."
+              autoFocus
+              prefix={<EditOutlined style={{ color: '#94a3b8' }} />}
+            />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {/* ============================================================ */}
       {/* MODAL 3: COLUMNS ORDER & VISIBILITY */}
       {/* ============================================================ */}
       <Modal
@@ -1983,6 +2202,15 @@ export default function App() {
                   <Text strong={!isHidden}>{col}</Text>
                 </div>
                 <Space>
+                  <Tooltip title="Ubah Nama Kolom (Rename)">
+                    <Button
+                      size="small"
+                      icon={<EditOutlined style={{ color: '#7c3aed' }} />}
+                      onClick={() => openRenameColumnModal(activeTab, col)}
+                    >
+                      Rename
+                    </Button>
+                  </Tooltip>
                   <Button
                     size="small"
                     icon={<ArrowLeftOutlined />}
@@ -2133,6 +2361,19 @@ export default function App() {
           )}
         </div>
       </Modal>
+
+      {/* Modal Koneksi Tersimpan Per-Akun */}
+      <SavedConnectionsModal
+        visible={savedConnectionsModalVisible}
+        onClose={() => setSavedConnectionsModalVisible(false)}
+        connections={savedDbConnections}
+        onSelectConnection={handleSelectSavedConnection}
+        onDeleteConnection={handleDeleteSavedConnection}
+        onAddNew={() => {
+          setSavedConnectionsModalVisible(false);
+          setIsConnected(false);
+        }}
+      />
     </div>
   );
 }

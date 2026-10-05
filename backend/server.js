@@ -1,24 +1,60 @@
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const { Pool } = require('pg');
-const Database = require('better-sqlite3');
+const mysql = require('mysql2/promise');
 const path = require('path');
 
+let Database = null;
+try {
+  Database = require('better-sqlite3');
+} catch (error) {
+  console.warn('⚠️ better-sqlite3 not available; skipping demo SQLite setup. This is expected on some shared hosting environments.');
+}
+
+const { initUserDatabase } = require('./src/db/userDb');
+const authRoutes = require('./src/routes/authRoutes');
+const userRoutes = require('./src/routes/userRoutes');
+const { optionalAuth, requireAuth } = require('./src/middleware/auth');
+const { parseDatabaseUri } = require('./src/utils/dbUriParser');
+
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// Cybersecurity: HTTP Security Headers
+app.use(helmet({
+  contentSecurityPolicy: false, // Allow inline scripts and React Dev/Vite
+  crossOriginEmbedderPolicy: false,
+}));
+
+// CORS Configuration
+app.use(cors({
+  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : true,
+  credentials: true,
+}));
+
+app.use(express.json({ limit: '10mb' }));
+
+// Mount Auth & User Routes
+app.use('/api/auth', authRoutes);
+app.use('/api/user', userRoutes);
 
 // Store connections (key → { type, pool/db, tables })
 const connections = new Map();
 
 function getConnectionKey({ host, port, database, user, password }) {
-  return `${host}:${port}:${database}:${user}:${password}`;
+  return `${host || 'localhost'}:${port || ''}:${database || ''}:${user || ''}:${password || ''}`;
 }
 
 // ============================================================
 //  DEMO SQLite Database — auto-created with sample data
 // ============================================================
 function createDemoDB() {
+  if (!Database) {
+    console.log('ℹ️ Demo SQLite database is disabled because better-sqlite3 is unavailable on this hosting environment.');
+    return;
+  }
+
   const dbPath = path.join(__dirname, 'demo.db');
   const db = Database(dbPath);
 
@@ -291,71 +327,294 @@ class SQLiteAdapter {
 }
 
 // ============================================================
-//  ROUTES
+//  MySQL / MariaDB Adapter
 // ============================================================
-
-// ---------- CONNECT ----------
-app.post('/api/connect', async (req, res) => {
-  const { host, port, database, user, password } = req.body;
-  if (!host || !port || !database || !user || !password) {
-    return res.status(400).json({ error: 'Semua field harus diisi' });
+class MySQLAdapter {
+  constructor(pool, databaseName) {
+    this.pool = pool;
+    this.databaseName = databaseName;
   }
 
-  const key = getConnectionKey({ host, port, database, user, password });
+  async getTables() {
+    const [rows] = await this.pool.query(
+      `SELECT TABLE_NAME as name FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME`,
+      [this.databaseName]
+    );
+    return rows.map(r => r.name);
+  }
+
+  async query(sql) {
+    const [rows, fields] = await this.pool.query(sql);
+    if (Array.isArray(rows)) {
+      const fieldList = (fields || []).map(f => ({ name: f.name }));
+      return { rows, fields: fieldList, rowCount: rows.length };
+    } else {
+      return { rows: [], fields: [], rowCount: rows.affectedRows || 0 };
+    }
+  }
+
+  async getTableStructure(tableName) {
+    const [columns] = await this.pool.query(
+      `SELECT COLUMN_NAME as column_name, DATA_TYPE as data_type, IS_NULLABLE as is_nullable,
+              COLUMN_DEFAULT as column_default, CHARACTER_MAXIMUM_LENGTH as character_maximum_length,
+              COLUMN_KEY as column_key
+       FROM information_schema.COLUMNS
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+       ORDER BY ORDINAL_POSITION`,
+      [this.databaseName, tableName]
+    );
+    return columns.map(c => ({
+      column_name: c.column_name,
+      data_type: c.data_type,
+      is_nullable: c.is_nullable,
+      column_default: c.column_default,
+      character_maximum_length: c.character_maximum_length,
+      is_primary_key: c.column_key === 'PRI',
+    }));
+  }
+
+  async getTableData(tableName, limit = 200, offset = 0, orderBy, orderDir = 'ASC') {
+    const [countResult] = await this.pool.query(
+      `SELECT COUNT(*) as c FROM \`${tableName}\``
+    );
+    const total = countResult[0]?.c || 0;
+
+    let orderSql = '';
+    if (orderBy) {
+      const safeDir = String(orderDir).toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+      orderSql = `ORDER BY \`${orderBy}\` ${safeDir}`;
+    }
+
+    const [rows, fields] = await this.pool.query(
+      `SELECT * FROM \`${tableName}\` ${orderSql} LIMIT ? OFFSET ?`,
+      [parseInt(limit), parseInt(offset)]
+    );
+    const fieldList = (fields || []).map(f => ({ name: f.name }));
+    return { rows, fields: fieldList, total };
+  }
+
+  async close() {
+    await this.pool.end().catch(() => {});
+  }
+}
+
+// Utility: format bytes to human readable
+function formatBytes(bytes, decimals = 2) {
+  if (!bytes || bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const dm = decimals < 0 ? 0 : decimals;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+// ============================================================
+//  ROUTES & CONNECTION LOGIC
+// ============================================================
+
+// Diagnostic error formatter for user-friendly Indonesian error messages
+function formatDbConnectionError(err, type, host, port, database) {
+  const msg = (err && err.message) ? err.message : String(err);
+  const lower = msg.toLowerCase();
+
+  if (lower.includes('emaxconnsession') || lower.includes('max clients reached in session mode')) {
+    return `Koneksi Supabase Session Mode Penuh (EMAXCONNSESSION). Batas pool 15 klien terlampaui di server Supabase Anda. ` +
+           `Ganti port 5432 menjadi 6543 (Transaction Mode) pada Connection URI Anda untuk koneksi tanpa batas pool session, atau tutup koneksi aktif lain di dashboard Supabase.`;
+  }
+  if (lower.includes('password authentication failed') || lower.includes('access denied for user')) {
+    return `Autentikasi gagal: Username atau kata sandi database salah. Pastikan kredensial yang dimasukkan sudah benar.`;
+  }
+  if (lower.includes('database') && (lower.includes('does not exist') || lower.includes('unknown database'))) {
+    return `Database '${database}' tidak ditemukan di server ${host}. Pastikan nama database sudah sesuai.`;
+  }
+  if (lower.includes('econnrefused')) {
+    return `Koneksi ditolak (ECONNREFUSED) pada ${host}:${port}. Pastikan database aktif dan port ${port} terbuka / tidak terblokir firewall.`;
+  }
+  if (lower.includes('enotfound') || lower.includes('getaddrinfo enotfound')) {
+    return `Host '${host}' tidak dapat ditemukan (DNS ENOTFOUND). Periksa kembali alamat hostname atau URL database Anda.`;
+  }
+  if (lower.includes('etimedout') || lower.includes('timeout') || lower.includes('connection timed out')) {
+    return `Waktu koneksi habis (ETIMEDOUT) ke ${host}:${port}. Pastikan server dapat diakses dari internet atau gunakan tunnel/VPN jika database di jaringan lokal.`;
+  }
+  if (lower.includes('ssl') || lower.includes('pg_hba.conf')) {
+    return `Koneksi SSL diperlukan atau ditolak oleh server database: ${msg}`;
+  }
+  return `Koneksi ${type || 'database'} gagal: ${msg}`;
+}
+
+// Universal connection builder supporting Connection URI, SSL auto-negotiation, and multi-database engines
+async function establishConnection(params) {
+  let { host, port, database, user, password, type, connection_string, connectionString, uri, ssl } = params;
+  let rawUri = (connection_string || connectionString || uri || '').trim();
+
+  if (rawUri) {
+    const parsed = parseDatabaseUri(rawUri);
+    if (parsed) {
+      host = host || parsed.host;
+      port = port || parsed.port;
+      database = database || parsed.database;
+      user = (user !== undefined && user !== null && user !== '') ? user : parsed.user;
+      password = (password !== undefined && password !== null && password !== '') ? password : parsed.password;
+      type = type || parsed.type;
+      if (ssl === undefined) ssl = parsed.ssl;
+      rawUri = parsed.connectionString;
+    }
+  }
+
+  // Engine & default normalization
+  type = (type || (rawUri.startsWith('mysql') ? 'mysql' : 'postgres')).toLowerCase();
+  user = user !== undefined && user !== null ? String(user) : 'postgres';
+  password = password !== undefined && password !== null ? String(password) : '';
 
   // --- DEMO MODE: connect to built-in SQLite ---
-  if (host === 'localhost' && database === 'demo') {
+  if ((host === 'localhost' && database === 'demo') || type === 'sqlite') {
     try {
       const db = createDemoDB();
       const adapter = new SQLiteAdapter(db);
       const tables = adapter.getTables();
-      connections.set(key, { type: 'sqlite', adapter, tables });
-      return res.json({ success: true, tables, engine: 'SQLite (Demo)' });
+      return {
+        type: 'sqlite',
+        adapter,
+        tables,
+        engine: 'SQLite (Local / Demo)',
+        host: 'localhost',
+        port: 3001,
+        database: 'demo',
+        user: 'demo',
+        password: '',
+        rawUri,
+      };
     } catch (err) {
-      return res.status(500).json({ error: 'Demo DB error: ' + err.message });
+      throw new Error('Demo DB error: ' + err.message);
     }
   }
 
-  // --- REAL MODE: connect to PostgreSQL ---
-  try {
-    let pool;
-    let connected = false;
-    let firstError;
+  if (!host || !port || !database) {
+    throw new Error('Host, Port, dan Nama Database wajib diisi atau disertakan dalam Connection URI.');
+  }
 
-    const baseConfig = {
-      host,
-      port: parseInt(port),
-      database,
-      user,
-      password,
-      connectionTimeoutMillis: 10000,
-    };
-
-    // Attempt 1: no SSL
+  // --- MYSQL / MARIADB MODE ---
+  const isMysql = type === 'mysql' || port === 3306 || port === '3306' || String(host).toLowerCase().includes('mysql');
+  if (isMysql) {
     try {
-      pool = new Pool(baseConfig);
+      const mysqlConfig = {
+        host,
+        port: parseInt(port) || 3306,
+        user: user || 'root',
+        password: password || '',
+        database,
+        waitForConnections: true,
+        connectionLimit: 10,
+        connectTimeout: 10000,
+      };
+      if (ssl) {
+        mysqlConfig.ssl = { rejectUnauthorized: false };
+      }
+
+      const pool = mysql.createPool(mysqlConfig);
+      await pool.query('SELECT 1');
+      const adapter = new MySQLAdapter(pool, database);
+      const tables = await adapter.getTables();
+      return {
+        type: 'mysql',
+        adapter,
+        pool,
+        tables,
+        engine: 'MySQL / MariaDB',
+        host,
+        port,
+        database,
+        user,
+        password,
+        rawUri,
+      };
+    } catch (err) {
+      throw new Error(formatDbConnectionError(err, 'MySQL', host, port, database));
+    }
+  }
+
+  // --- POSTGRESQL MODE (With Smart SSL Auto-Negotiation & Supabase Session Protection) ---
+  let pool = null;
+  let connected = false;
+  let lastError = null;
+
+  // Lean pool settings: limit max concurrent clients to 2 and release idle clients quickly (2s)
+  // This prevents hitting Supabase's strict 15-client limit in Session Mode
+  const poolSettings = {
+    max: 2,
+    idleTimeoutMillis: 2000,
+    connectionTimeoutMillis: 10000,
+    allowExitOnIdle: true,
+  };
+
+  // Build PG configurations to try:
+  // If rawUri is present, use connectionString; else use host/port config
+  const basePgConfig = rawUri
+    ? { connectionString: rawUri, ...poolSettings }
+    : { host, port: parseInt(port), database, user, password, ...poolSettings };
+
+  const attempts = [];
+  if (ssl) {
+    // User or URI explicitly requested SSL
+    attempts.push({ ...basePgConfig, ssl: { rejectUnauthorized: false } });
+    attempts.push({ ...basePgConfig, ssl: false });
+  } else {
+    // Try standard first, auto-upgrade to SSL if required by cloud provider
+    attempts.push({ ...basePgConfig, ssl: false });
+    attempts.push({ ...basePgConfig, ssl: { rejectUnauthorized: false } });
+  }
+
+  for (const config of attempts) {
+    try {
+      pool = new Pool(config);
       await pool.query('SELECT 1');
       connected = true;
+      break;
     } catch (err) {
-      firstError = err;
-      if (pool) await pool.end().catch(() => {});
-      pool = null;
-    }
-
-    // Attempt 2: with SSL
-    if (!connected && firstError && firstError.message && firstError.message.toLowerCase().includes('ssl')) {
-      try {
-        pool = new Pool({ ...baseConfig, ssl: { rejectUnauthorized: false } });
-        await pool.query('SELECT 1');
-        connected = true;
-      } catch (err) {
-        if (pool) await pool.end().catch(() => {});
+      lastError = err;
+      if (pool) {
+        await pool.end().catch(() => {});
         pool = null;
       }
     }
+  }
 
-    if (!connected) throw firstError || new Error('Tidak bisa terhubung');
+  // --- SUPABASE SESSION POOL EXHAUSTION AUTO-FALLBACK ---
+  // If Session Mode (:5432) is exhausted with EMAXCONNSESSION, automatically try port 6543 (Transaction Mode)
+  if (!connected && lastError) {
+    const errText = String(lastError.message || '').toLowerCase();
+    const isSupabaseSessionFull = errText.includes('emaxconnsession') || errText.includes('max clients reached');
+    const isPort5432 = port === 5432 || port === '5432' || (rawUri && rawUri.includes(':5432'));
 
+    if (isSupabaseSessionFull && isPort5432) {
+      console.log('⚡ Supabase Session Mode (:5432) penuh. Mencoba beralih otomatis ke Transaction Mode (:6543)...');
+      let altUri = rawUri ? rawUri.replace(':5432', ':6543') : null;
+      let altPort = 6543;
+      const altConfig = altUri
+        ? { connectionString: altUri, ssl: { rejectUnauthorized: false }, ...poolSettings }
+        : { host, port: altPort, database, user, password, ssl: { rejectUnauthorized: false }, ...poolSettings };
+
+      try {
+        pool = new Pool(altConfig);
+        await pool.query('SELECT 1');
+        connected = true;
+        rawUri = altUri || rawUri;
+        port = altPort;
+        console.log('✅ Berhasil terhubung ke Supabase Transaction Mode pada port 6543!');
+      } catch (altErr) {
+        if (pool) {
+          await pool.end().catch(() => {});
+          pool = null;
+        }
+      }
+    }
+  }
+
+  if (!connected) {
+    throw new Error(formatDbConnectionError(lastError, 'PostgreSQL', host, port, database));
+  }
+
+  try {
     const tablesResult = await pool.query(`
       SELECT table_name
       FROM information_schema.tables
@@ -364,35 +623,333 @@ app.post('/api/connect', async (req, res) => {
     `);
     const tables = tablesResult.rows.map(row => row.table_name);
 
-    connections.set(key, { type: 'pg', pool, tables });
-    res.json({ success: true, tables, engine: 'PostgreSQL' });
+    return {
+      type: 'pg',
+      pool,
+      tables,
+      engine: (String(host).includes('supabase') || port === 6543)
+        ? 'PostgreSQL (Supabase)'
+        : 'PostgreSQL',
+      host,
+      port,
+      database,
+      user,
+      password,
+      rawUri,
+    };
   } catch (err) {
-    res.status(401).json({ error: 'Koneksi gagal: ' + err.message });
+    if (pool) await pool.end().catch(() => {});
+    throw new Error('Gagal mengambil daftar tabel: ' + err.message);
+  }
+}
+
+// ---------- TEST CONNECTION (POIN 6 & 8) ----------
+app.post('/api/connect/test', requireAuth, async (req, res) => {
+  try {
+    const connData = await establishConnection(req.body);
+    // If pool was opened, clean it up immediately
+    if (connData.pool) {
+      await connData.pool.end().catch(() => {});
+    }
+    return res.json({
+      success: true,
+      message: `Koneksi berhasil! Terhubung ke ${connData.engine}. Ditemukan ${connData.tables.length} tabel.`,
+      engine: connData.engine,
+      tableCount: connData.tables.length,
+      tables: connData.tables.slice(0, 10),
+    });
+  } catch (err) {
+    return res.status(400).json({
+      success: false,
+      error: err.message || 'Koneksi gagal',
+    });
+  }
+});
+
+// ---------- CONNECT ----------
+app.post('/api/connect', requireAuth, async (req, res) => {
+  try {
+    const connData = await establishConnection(req.body);
+    const key = getConnectionKey({
+      host: connData.host,
+      port: connData.port,
+      database: connData.database,
+      user: connData.user,
+      password: connData.password,
+    });
+
+    // Close any previous connection under this key
+    if (connections.has(key)) {
+      const oldConn = connections.get(key);
+      if (oldConn.pool) await oldConn.pool.end().catch(() => {});
+      if (oldConn.adapter && oldConn.adapter.close) await oldConn.adapter.close().catch(() => {});
+    }
+
+    connections.set(key, connData);
+
+    return res.json({
+      success: true,
+      tables: connData.tables,
+      engine: connData.engine,
+      host: connData.host,
+      port: connData.port,
+      database: connData.database,
+      user: connData.user,
+    });
+  } catch (err) {
+    return res.status(401).json({
+      success: false,
+      error: err.message || 'Koneksi gagal',
+    });
+  }
+});
+
+// ---------- DATABASE RESOURCE & STORAGE METRICS (POIN 8) ----------
+app.post('/api/database/metrics', requireAuth, getConnection, async (req, res) => {
+  const conn = req.conn;
+  const startTime = Date.now();
+
+  try {
+    // 1. SQLite Metrics
+    if (conn.type === 'sqlite') {
+      const db = conn.adapter.db;
+      let pageCount = 0;
+      let pageSize = 4096;
+      let freeList = 0;
+      try {
+        const pc = db.prepare('PRAGMA page_count').get();
+        pageCount = pc ? (pc.page_count || Object.values(pc)[0] || 0) : 0;
+      } catch { /* ignore */ }
+      try {
+        const ps = db.prepare('PRAGMA page_size').get();
+        pageSize = ps ? (ps.page_size || Object.values(ps)[0] || 4096) : 4096;
+      } catch { /* ignore */ }
+      try {
+        const fl = db.prepare('PRAGMA freelist_count').get();
+        freeList = fl ? (fl.freelist_count || Object.values(fl)[0] || 0) : 0;
+      } catch { /* ignore */ }
+
+      const sizeBytes = pageCount * pageSize;
+      const freeBytes = freeList * pageSize;
+      let version = '3.x';
+      try {
+        const vRow = db.prepare('SELECT sqlite_version() as v').get();
+        version = vRow?.v || '3.x';
+      } catch { /* ignore */ }
+
+      let tableList = conn.tables;
+      if (!tableList || tableList.length === 0) {
+        if (conn.adapter && conn.adapter.getTables) {
+          tableList = conn.adapter.getTables();
+          conn.tables = tableList;
+        }
+      }
+
+      const tablesCount = tableList ? tableList.length : 0;
+      let totalRows = 0;
+      const topTables = [];
+
+      for (const t of (tableList || []).slice(0, 5)) {
+        try {
+          const rowCount = db.prepare(`SELECT COUNT(*) as c FROM "${t}"`).get()['c'] || 0;
+          totalRows += rowCount;
+          topTables.push({ name: t, rowCount, estimatedSize: formatBytes(rowCount * 160 || 1024) });
+        } catch { /* ignore */ }
+      }
+
+      return res.json({
+        success: true,
+        engine: 'SQLite 3 (Local Embedded)',
+        version: `SQLite v${version}`,
+        sizeFormatted: formatBytes(sizeBytes || 65536),
+        sizeBytes: sizeBytes || 65536,
+        freeFormatted: formatBytes(freeBytes),
+        tablesCount,
+        totalRows,
+        activeConnections: 1,
+        maxConnections: 1,
+        latencyMs: Date.now() - startTime,
+        topTables,
+      });
+    }
+
+    // 2. MySQL / MariaDB Metrics
+    if (conn.type === 'mysql') {
+      const pool = conn.adapter.pool;
+      const dbName = conn.adapter.databaseName;
+
+      // Size
+      const [sizeRows] = await pool.query(`
+        SELECT SUM(data_length + index_length) as size_bytes
+        FROM information_schema.TABLES
+        WHERE table_schema = ?
+      `, [dbName]);
+      const sizeBytes = Number(sizeRows[0]?.size_bytes || 0);
+
+      // Active & Max Connections
+      let activeConnections = 1;
+      try {
+        const [threadRows] = await pool.query("SHOW STATUS LIKE 'Threads_connected'");
+        activeConnections = parseInt(threadRows[0]?.Value || '1');
+      } catch { /* ignore */ }
+
+      let maxConnections = 151;
+      try {
+        const [maxConnRows] = await pool.query("SHOW VARIABLES LIKE 'max_connections'");
+        maxConnections = parseInt(maxConnRows[0]?.Value || '151');
+      } catch { /* ignore */ }
+
+      // Version
+      let version = 'MySQL';
+      try {
+        const [verRows] = await pool.query("SELECT VERSION() as v");
+        version = verRows[0]?.v || 'MySQL';
+      } catch { /* ignore */ }
+
+      // Top Tables
+      let topTables = [];
+      let totalRows = 0;
+      try {
+        const [tableStats] = await pool.query(`
+          SELECT TABLE_NAME as name, TABLE_ROWS as row_count, (DATA_LENGTH + INDEX_LENGTH) as size_bytes
+          FROM information_schema.TABLES
+          WHERE TABLE_SCHEMA = ?
+          ORDER BY (DATA_LENGTH + INDEX_LENGTH) DESC
+          LIMIT 5
+        `, [dbName]);
+
+        topTables = (tableStats || []).map(t => ({
+          name: t.name,
+          rowCount: parseInt(t.row_count || 0),
+          estimatedSize: formatBytes(t.size_bytes || 0),
+        }));
+
+        totalRows = (tableStats || []).reduce((acc, t) => acc + parseInt(t.row_count || 0), 0);
+      } catch { /* ignore */ }
+
+      return res.json({
+        success: true,
+        engine: version.toLowerCase().includes('maria') ? 'MariaDB' : 'MySQL',
+        version: `MySQL / MariaDB (${version})`,
+        sizeFormatted: formatBytes(sizeBytes),
+        sizeBytes,
+        tablesCount: conn.tables ? conn.tables.length : 0,
+        totalRows,
+        activeConnections,
+        maxConnections,
+        latencyMs: Date.now() - startTime,
+        topTables,
+      });
+    }
+
+    // 3. PostgreSQL Metrics
+    if (conn.type === 'pg') {
+      const pool = conn.pool;
+
+      // Size
+      const sizeRes = await pool.query('SELECT pg_database_size(current_database()) as size_bytes, pg_size_pretty(pg_database_size(current_database())) as pretty_size');
+      const sizeBytes = parseInt(sizeRes.rows[0]?.size_bytes || 0);
+      const sizeFormatted = sizeRes.rows[0]?.pretty_size || '0 MB';
+
+      // Connections
+      const connRes = await pool.query('SELECT count(*) as active_conns FROM pg_stat_activity WHERE datname = current_database()');
+      const activeConnections = parseInt(connRes.rows[0]?.active_conns || 1);
+      const maxConnRes = await pool.query("SHOW max_connections");
+      const maxConnections = parseInt(maxConnRes.rows[0]?.max_connections || 100);
+
+      // Version
+      const verRes = await pool.query('SELECT version() as v');
+      const fullVersion = verRes.rows[0]?.v || 'PostgreSQL';
+      const shortVersion = fullVersion.split(' on ')[0] || 'PostgreSQL';
+
+      // Top tables by size
+      const topTablesRes = await pool.query(`
+        SELECT table_name,
+               pg_size_pretty(pg_total_relation_size(quote_ident(table_name))) as total_size,
+               pg_total_relation_size(quote_ident(table_name)) as size_bytes
+        FROM information_schema.tables
+        WHERE table_schema = 'public'
+        ORDER BY pg_total_relation_size(quote_ident(table_name)) DESC
+        LIMIT 5
+      `);
+
+      const topTables = topTablesRes.rows.map(r => ({
+        name: r.table_name,
+        estimatedSize: r.total_size,
+        sizeBytes: parseInt(r.size_bytes || 0),
+      }));
+
+      return res.json({
+        success: true,
+        engine: 'PostgreSQL',
+        version: shortVersion,
+        sizeFormatted,
+        sizeBytes,
+        tablesCount: conn.tables ? conn.tables.length : 0,
+        activeConnections,
+        maxConnections,
+        latencyMs: Date.now() - startTime,
+        topTables,
+      });
+    }
+
+    res.json({ success: true, latencyMs: Date.now() - startTime });
+  } catch (err) {
+    console.error('Metrics Error:', err);
+    res.status(500).json({ error: 'Gagal mengambil metrik database: ' + err.message });
   }
 });
 
 // ---------- MIDDLEWARE ----------
 function getConnection(req, res, next) {
-  const { host, port, database, user, password } = req.body;
-  if (!host || !port || !database || !user || !password) {
-    return res.status(400).json({ error: 'Kredensial tidak lengkap' });
+  let { host, port, database, user, password, connection_string, connectionString, uri } = req.body;
+  const rawUri = connection_string || connectionString || uri;
+  if (rawUri && (!host || !database)) {
+    const parsed = parseDatabaseUri(rawUri);
+    if (parsed) {
+      host = host || parsed.host;
+      port = port || parsed.port;
+      database = database || parsed.database;
+      user = (user !== undefined && user !== null) ? user : parsed.user;
+      password = (password !== undefined && password !== null) ? password : parsed.password;
+    }
   }
+
+  if (!host || !port || !database) {
+    return res.status(400).json({ error: 'Kredensial database tidak lengkap' });
+  }
+
   const key = getConnectionKey({ host, port, database, user, password });
-  const conn = connections.get(key);
+  let conn = connections.get(key);
+
   if (!conn) {
-    return res.status(401).json({ error: 'Koneksi tidak ditemukan, silakan koneksi ulang' });
+    // Resilient fallback match across active connections
+    for (const [k, v] of connections.entries()) {
+      if (v.host === host && v.database === database) {
+        conn = v;
+        break;
+      }
+    }
+  }
+
+  if (!conn) {
+    return res.status(401).json({ error: 'Sesi koneksi tidak ditemukan atau telah kedaluwarsa. Silakan hubungkan ulang database.' });
   }
   req.conn = conn;
   next();
 }
 
 // ---------- QUERY ----------
-app.post('/api/query', getConnection, async (req, res) => {
+app.post('/api/query', requireAuth, getConnection, async (req, res) => {
   const { sql } = req.body;
   if (!sql) return res.status(400).json({ error: 'Query SQL diperlukan' });
   try {
     if (req.conn.type === 'sqlite') {
       const result = req.conn.adapter.query(sql);
+      return res.json(result);
+    }
+    if (req.conn.type === 'mysql') {
+      const result = await req.conn.adapter.query(sql);
       return res.json(result);
     }
     // PostgreSQL
@@ -405,12 +962,16 @@ app.post('/api/query', getConnection, async (req, res) => {
 });
 
 // ---------- TABLE STRUCTURE ----------
-app.post('/api/table', getConnection, async (req, res) => {
+app.post('/api/table', requireAuth, getConnection, async (req, res) => {
   const { tableName } = req.body;
   if (!tableName) return res.status(400).json({ error: 'Nama tabel diperlukan' });
   try {
     if (req.conn.type === 'sqlite') {
       return res.json(req.conn.adapter.getTableStructure(tableName));
+    }
+    if (req.conn.type === 'mysql') {
+      const structure = await req.conn.adapter.getTableStructure(tableName);
+      return res.json(structure);
     }
     const result = await req.conn.pool.query(`
       SELECT
@@ -432,12 +993,16 @@ app.post('/api/table', getConnection, async (req, res) => {
 });
 
 // ---------- TABLE DATA ----------
-app.post('/api/table/data', getConnection, async (req, res) => {
+app.post('/api/table/data', requireAuth, getConnection, async (req, res) => {
   const { tableName, limit = 200, offset = 0, orderBy, orderDir = 'ASC' } = req.body;
   if (!tableName) return res.status(400).json({ error: 'Nama tabel diperlukan' });
   try {
     if (req.conn.type === 'sqlite') {
       return res.json(req.conn.adapter.getTableData(tableName, limit, offset));
+    }
+    if (req.conn.type === 'mysql') {
+      const data = await req.conn.adapter.getTableData(tableName, limit, offset, orderBy, orderDir);
+      return res.json(data);
     }
     const countResult = await req.conn.pool.query(`SELECT COUNT(*) AS total FROM "${tableName}"`);
     const total = parseInt(countResult.rows[0].total);
@@ -478,7 +1043,7 @@ app.post('/api/table/data', getConnection, async (req, res) => {
 });
 
 // ---------- REFRESH TABLE LIST ----------
-app.post('/api/tables', getConnection, async (req, res) => {
+app.post('/api/tables', requireAuth, getConnection, async (req, res) => {
   try {
     if (req.conn.type === 'sqlite') {
       const tables = req.conn.adapter.getTables();
@@ -499,8 +1064,8 @@ app.post('/api/tables', getConnection, async (req, res) => {
 
 // Helper: Inspect column data types for safe SQL operations
 async function getTableColumnTypes(conn, tableName) {
-  if (conn.type === 'sqlite') {
-    const struct = conn.adapter.getTableStructure(tableName);
+  if (conn.type === 'sqlite' || conn.type === 'mysql') {
+    const struct = await conn.adapter.getTableStructure(tableName);
     const map = {};
     for (const c of struct) {
       map[c.column_name] = {
@@ -590,7 +1155,7 @@ function castValueForType(val, colInfo) {
 }
 
 // ---------- INSERT ROW ----------
-app.post('/api/table/insert', getConnection, async (req, res) => {
+app.post('/api/table/insert', requireAuth, getConnection, async (req, res) => {
   const { tableName, row } = req.body;
   if (!tableName || !row) return res.status(400).json({ error: 'tableName dan row diperlukan' });
   try {
@@ -628,12 +1193,19 @@ app.post('/api/table/insert', getConnection, async (req, res) => {
       }
     }
 
-    if (req.conn.type === 'sqlite') {
+    if (req.conn.type === 'sqlite' || req.conn.type === 'mysql') {
+      const isSqlite = req.conn.type === 'sqlite';
+      const quote = isSqlite ? '"' : '`';
       const placeholders = keys.map(() => '?').join(', ');
-      const cols = keys.map(k => `"${k}"`).join(', ');
-      const sql = `INSERT INTO "${tableName}" (${cols}) VALUES (${placeholders})`;
-      const info = req.conn.adapter.db.prepare(sql).run(...values);
-      return res.json({ success: true, lastInsertRowid: info.lastInsertRowid });
+      const cols = keys.map(k => `${quote}${k}${quote}`).join(', ');
+      const sql = `INSERT INTO ${quote}${tableName}${quote} (${cols}) VALUES (${placeholders})`;
+      if (isSqlite) {
+        const info = req.conn.adapter.db.prepare(sql).run(...values);
+        return res.json({ success: true, lastInsertRowid: info.lastInsertRowid });
+      } else {
+        const [info] = await req.conn.adapter.pool.query(sql, values);
+        return res.json({ success: true, lastInsertRowid: info.insertId });
+      }
     }
 
     const placeholders = keys.map((_, i) => `$${i + 1}`).join(', ');
@@ -647,7 +1219,7 @@ app.post('/api/table/insert', getConnection, async (req, res) => {
 });
 
 // ---------- UPDATE CELL ----------
-app.post('/api/table/update', getConnection, async (req, res) => {
+app.post('/api/table/update', requireAuth, getConnection, async (req, res) => {
   const { tableName, pkColumn, pkValue, column, value } = req.body;
   if (!tableName || !pkColumn || pkValue === undefined || !column) {
     return res.status(400).json({ error: 'tableName, pkColumn, pkValue, column diperlukan' });
@@ -672,7 +1244,7 @@ app.post('/api/table/update', getConnection, async (req, res) => {
 });
 
 // ---------- UPDATE FULL ROW (ATOMIC) ----------
-app.post('/api/table/update-row', getConnection, async (req, res) => {
+app.post('/api/table/update-row', requireAuth, getConnection, async (req, res) => {
   const { tableName, primaryKeys, updates } = req.body;
   if (!tableName || !primaryKeys || !updates || Object.keys(updates).length === 0) {
     return res.status(400).json({ error: 'tableName, primaryKeys, dan updates diperlukan' });
@@ -686,14 +1258,21 @@ app.post('/api/table/update-row', getConnection, async (req, res) => {
       return res.json({ success: true, changes: 0 });
     }
 
-    if (req.conn.type === 'sqlite') {
-      const setClauses = updateKeys.map(k => `"${k}" = ?`).join(', ');
-      const whereClauses = pkKeys.map(k => `"${k}" = ?`).join(' AND ');
+    if (req.conn.type === 'sqlite' || req.conn.type === 'mysql') {
+      const isSqlite = req.conn.type === 'sqlite';
+      const quote = isSqlite ? '"' : '`';
+      const setClauses = updateKeys.map(k => `${quote}${k}${quote} = ?`).join(', ');
+      const whereClauses = pkKeys.map(k => `${quote}${k}${quote} = ?`).join(' AND ');
       const setVals = updateKeys.map(k => castValueForType(updates[k], colTypes[k]));
       const pkVals = pkKeys.map(k => primaryKeys[k]);
-      const sql = `UPDATE "${tableName}" SET ${setClauses} WHERE ${whereClauses}`;
-      const info = req.conn.adapter.db.prepare(sql).run(...setVals, ...pkVals);
-      return res.json({ success: true, changes: info.changes });
+      const sql = `UPDATE ${quote}${tableName}${quote} SET ${setClauses} WHERE ${whereClauses}`;
+      if (isSqlite) {
+        const info = req.conn.adapter.db.prepare(sql).run(...setVals, ...pkVals);
+        return res.json({ success: true, changes: info.changes });
+      } else {
+        const [info] = await req.conn.adapter.pool.query(sql, [...setVals, ...pkVals]);
+        return res.json({ success: true, changes: info.affectedRows });
+      }
     }
 
     // PostgreSQL
@@ -712,7 +1291,7 @@ app.post('/api/table/update-row', getConnection, async (req, res) => {
 });
 
 // ---------- DELETE ROW ----------
-app.post('/api/table/delete-row', getConnection, async (req, res) => {
+app.post('/api/table/delete-row', requireAuth, getConnection, async (req, res) => {
   const { tableName, pkColumn, pkValue, primaryKeys } = req.body;
   if (!tableName) {
     return res.status(400).json({ error: 'tableName diperlukan' });
@@ -724,11 +1303,18 @@ app.post('/api/table/delete-row', getConnection, async (req, res) => {
     }
 
     const pkKeys = Object.keys(keysMap);
-    if (req.conn.type === 'sqlite') {
-      const whereClauses = pkKeys.map(k => `"${k}" = ?`).join(' AND ');
-      const sql = `DELETE FROM "${tableName}" WHERE ${whereClauses}`;
-      const info = req.conn.adapter.db.prepare(sql).run(...Object.values(keysMap));
-      return res.json({ success: true, changes: info.changes });
+    if (req.conn.type === 'sqlite' || req.conn.type === 'mysql') {
+      const isSqlite = req.conn.type === 'sqlite';
+      const quote = isSqlite ? '"' : '`';
+      const whereClauses = pkKeys.map(k => `${quote}${k}${quote} = ?`).join(' AND ');
+      const sql = `DELETE FROM ${quote}${tableName}${quote} WHERE ${whereClauses}`;
+      if (isSqlite) {
+        const info = req.conn.adapter.db.prepare(sql).run(...Object.values(keysMap));
+        return res.json({ success: true, changes: info.changes });
+      } else {
+        const [info] = await req.conn.adapter.pool.query(sql, Object.values(keysMap));
+        return res.json({ success: true, changes: info.affectedRows });
+      }
     }
 
     let paramIdx = 1;
@@ -742,7 +1328,7 @@ app.post('/api/table/delete-row', getConnection, async (req, res) => {
 });
 
 // ---------- CREATE TABLE ----------
-app.post('/api/table/create', getConnection, async (req, res) => {
+app.post('/api/table/create', requireAuth, getConnection, async (req, res) => {
   const { tableName, columns, initialData } = req.body;
   if (!tableName || !columns || !columns.length) {
     return res.status(400).json({ error: 'tableName dan columns diperlukan' });
@@ -812,7 +1398,7 @@ app.post('/api/table/create', getConnection, async (req, res) => {
 });
 
 // ---------- DROP TABLE ----------
-app.post('/api/table/drop', getConnection, async (req, res) => {
+app.post('/api/table/drop', requireAuth, getConnection, async (req, res) => {
   const { tableName } = req.body;
   if (!tableName) return res.status(400).json({ error: 'tableName diperlukan' });
   try {
@@ -835,13 +1421,15 @@ app.post('/api/table/drop', getConnection, async (req, res) => {
 });
 
 // ---------- ADD COLUMN ----------
-app.post('/api/table/add-column', getConnection, async (req, res) => {
+app.post('/api/table/add-column', requireAuth, getConnection, async (req, res) => {
   const { tableName, columnName, columnType, notNull, defaultValue } = req.body;
   if (!tableName || !columnName || !columnType) {
     return res.status(400).json({ error: 'tableName, columnName, columnType diperlukan' });
   }
   try {
-    let sql = `ALTER TABLE "${tableName}" ADD COLUMN "${columnName}" ${columnType}`;
+    const isMysql = req.conn.type === 'mysql';
+    const q = isMysql ? '`' : '"';
+    let sql = `ALTER TABLE ${q}${tableName}${q} ADD COLUMN ${q}${columnName}${q} ${columnType}`;
     if (defaultValue !== undefined && defaultValue !== '') sql += ` DEFAULT ${defaultValue}`;
     if (notNull) sql += ' NOT NULL';
 
@@ -857,13 +1445,15 @@ app.post('/api/table/add-column', getConnection, async (req, res) => {
 });
 
 // ---------- DROP COLUMN ----------
-app.post('/api/table/drop-column', getConnection, async (req, res) => {
+app.post('/api/table/drop-column', requireAuth, getConnection, async (req, res) => {
   const { tableName, columnName } = req.body;
   if (!tableName || !columnName) {
     return res.status(400).json({ error: 'tableName, columnName diperlukan' });
   }
   try {
-    const sql = `ALTER TABLE "${tableName}" DROP COLUMN "${columnName}"`;
+    const isMysql = req.conn.type === 'mysql';
+    const q = isMysql ? '`' : '"';
+    const sql = `ALTER TABLE ${q}${tableName}${q} DROP COLUMN ${q}${columnName}${q}`;
     if (req.conn.type === 'sqlite') {
       req.conn.adapter.db.exec(sql);
       return res.json({ success: true });
@@ -875,8 +1465,59 @@ app.post('/api/table/drop-column', getConnection, async (req, res) => {
   }
 });
 
+// ---------- RENAME COLUMN ----------
+app.post('/api/table/rename-column', requireAuth, getConnection, async (req, res) => {
+  const { tableName, oldColumnName, newColumnName } = req.body;
+  if (!tableName || !oldColumnName || !newColumnName) {
+    return res.status(400).json({ error: 'tableName, oldColumnName, newColumnName diperlukan' });
+  }
+  if (oldColumnName === newColumnName) {
+    return res.status(400).json({ error: 'Nama kolom baru tidak boleh sama dengan nama kolom lama' });
+  }
+  try {
+    if (req.conn.type === 'sqlite') {
+      const sql = `ALTER TABLE "${tableName}" RENAME COLUMN "${oldColumnName}" TO "${newColumnName}"`;
+      req.conn.adapter.db.exec(sql);
+      return res.json({ success: true });
+    }
+
+    if (req.conn.type === 'mysql') {
+      const sql = `ALTER TABLE \`${tableName}\` RENAME COLUMN \`${oldColumnName}\` TO \`${newColumnName}\``;
+      try {
+        await req.conn.pool.query(sql);
+      } catch (mysqlErr) {
+        // Fallback for older MySQL / MariaDB using CHANGE COLUMN
+        const [colInfo] = await req.conn.pool.query(
+          `SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+           FROM information_schema.COLUMNS
+           WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND COLUMN_NAME = ?`,
+          [req.conn.database, tableName, oldColumnName]
+        );
+        if (colInfo && colInfo.length > 0) {
+          const c = colInfo[0];
+          let def = c.COLUMN_TYPE;
+          if (c.IS_NULLABLE === 'NO') def += ' NOT NULL';
+          if (c.COLUMN_DEFAULT !== null) def += ` DEFAULT '${c.COLUMN_DEFAULT}'`;
+          const fallbackSql = `ALTER TABLE \`${tableName}\` CHANGE COLUMN \`${oldColumnName}\` \`${newColumnName}\` ${def}`;
+          await req.conn.pool.query(fallbackSql);
+        } else {
+          throw mysqlErr;
+        }
+      }
+      return res.json({ success: true });
+    }
+
+    // PostgreSQL
+    const sql = `ALTER TABLE "${tableName}" RENAME COLUMN "${oldColumnName}" TO "${newColumnName}"`;
+    await req.conn.pool.query(sql);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
 // ---------- TRUNCATE TABLE ----------
-app.post('/api/table/truncate', getConnection, async (req, res) => {
+app.post('/api/table/truncate', requireAuth, getConnection, async (req, res) => {
   const { tableName } = req.body;
   if (!tableName) return res.status(400).json({ error: 'tableName diperlukan' });
   try {
@@ -892,17 +1533,89 @@ app.post('/api/table/truncate', getConnection, async (req, res) => {
 });
 
 // ---------- DISCONNECT ----------
-app.post('/api/disconnect', (req, res) => {
+app.post('/api/disconnect', requireAuth, (req, res) => {
   const { host, port, database, user, password } = req.body;
   const key = getConnectionKey({ host, port, database, user, password });
   const conn = connections.get(key);
   if (conn) {
-    if (conn.type === 'sqlite') conn.adapter.close();
+    if (conn.type === 'sqlite' || conn.type === 'mysql') conn.adapter.close();
     else if (conn.pool) conn.pool.end();
     connections.delete(key);
   }
   res.json({ success: true });
 });
 
+// ---------- SERVING FRONTEND FOR HOSTING (Production) ----------
+const fs = require('fs');
+const distPath = (() => {
+  const candidates = [
+    path.join(__dirname, '../frontend/dist'),
+    path.join(process.cwd(), 'frontend/dist'),
+    path.join(process.cwd(), 'dist'),
+    path.join(__dirname, 'dist'),
+    path.join(__dirname, '../../frontend/dist'),
+    path.join(process.cwd(), 'public'),
+  ];
+  return candidates.find(p => fs.existsSync(path.join(p, 'index.html'))) || candidates.find(p => fs.existsSync(p)) || candidates[0];
+})();
+
+const hasDistIndex = fs.existsSync(path.join(distPath, 'index.html'));
+
+if (hasDistIndex) {
+  app.use(express.static(distPath, {
+    maxAge: '1d',
+    etag: true,
+  }));
+  // Catch-all: kirim index.html untuk semua route non-API (React Router SPA)
+  app.get(/^(?!\/api).*$/, (req, res) => {
+    res.sendFile(path.join(distPath, 'index.html'));
+  });
+  console.log('📦 Frontend static dist siap disajikan di root URL:', distPath);
+} else {
+  console.warn('⚠️ Folder frontend/dist/index.html belum ditemukan. Pastikan build frontend telah dijalankan (npm run build).');
+  // Fallback status page informatif jika folder dist belum di-build
+  app.get(/^(?!\/api).*$/, (req, res) => {
+    res.status(200).send(`
+      <!DOCTYPE html>
+      <html lang="id">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>App Database — Server Aktif</title>
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0b0f19; color: #f1f5f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
+          .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 36px; max-width: 520px; text-align: center; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+          h1 { color: #818cf8; margin-top: 0; font-size: 24px; }
+          p { color: #94a3b8; line-height: 1.6; font-size: 14px; }
+          code { background: #0f172a; padding: 4px 8px; border-radius: 6px; color: #38bdf8; font-size: 13px; border: 1px solid #1e293b; }
+          .badge { display: inline-block; background: #10b981; color: #fff; padding: 4px 12px; border-radius: 9999px; font-size: 12px; font-weight: 600; margin-bottom: 16px; }
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <div class="badge">Backend API Online</div>
+          <h1>⚡ App Database Server Berjalan</h1>
+          <p>Server backend telah aktif dan siap digunakan. Namun file aset antarmuka (frontend) belum selesai di-build ke folder <code>frontend/dist</code>.</p>
+          <p>Untuk mengaktifkan antarmuka web, jalankan perintah:<br><code>npm run build</code></p>
+          <p style="margin-top: 20px; font-size: 12px; color: #64748b;">App Database &copy; ${new Date().getFullYear()} • Dibuat oleh Fajar Wahyudi</p>
+        </div>
+      </body>
+      </html>
+    `);
+  });
+}
+
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`✅ App Database Backend running on http://localhost:${PORT}`));
+
+async function startServer() {
+  try {
+    await initUserDatabase();
+  } catch (dbErr) {
+    console.warn('⚠️ Inisialisasi database awal mengalami kendala:', dbErr.message);
+    console.warn('Aplikasi tetap melanjutkan start server agar website tidak crash.');
+  }
+
+  app.listen(PORT, () => console.log(`✅ App Database Backend running on http://localhost:${PORT}`));
+}
+
+startServer();
