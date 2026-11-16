@@ -1,7 +1,7 @@
-import React from 'react';
-import { Modal, Table, Button, Space, Tag, Popconfirm, Typography, Empty } from 'antd';
+import React, { useState } from 'react';
+import { Modal, Table, Button, Space, Tag, Popconfirm, Typography, Empty, Input } from 'antd';
 import {
-  DatabaseOutlined, ThunderboltOutlined, DeleteOutlined, PlusOutlined,
+  DatabaseOutlined, ThunderboltOutlined, DeleteOutlined, PlusOutlined, SearchOutlined,
 } from '@ant-design/icons';
 
 const { Text } = Typography;
@@ -15,6 +15,18 @@ export default function SavedConnectionsModal({
   onDeleteConnection,
   onAddNew,
 }) {
+  const [searchKw, setSearchKw] = useState('');
+
+  const filteredConnections = connections.filter((c) => {
+    const q = searchKw.toLowerCase().trim();
+    if (!q) return true;
+    return (
+      (c.name && c.name.toLowerCase().includes(q)) ||
+      (c.database_name && c.database_name.toLowerCase().includes(q)) ||
+      (c.host && c.host.toLowerCase().includes(q)) ||
+      (c.type && c.type.toLowerCase().includes(q))
+    );
+  });
   const columns = [
     {
       title: 'Nama Slot',
@@ -125,8 +137,18 @@ export default function SavedConnectionsModal({
       centered
     >
       <div style={{ marginTop: 12 }}>
+        <div style={{ marginBottom: 12 }}>
+          <Input
+            placeholder="Cari slot database (nama, host, tipe, db)..."
+            prefix={<SearchOutlined style={{ color: '#94a3b8' }} />}
+            value={searchKw}
+            onChange={(e) => setSearchKw(e.target.value)}
+            allowClear
+            style={{ borderRadius: 6 }}
+          />
+        </div>
         <Table
-          dataSource={connections}
+          dataSource={filteredConnections}
           columns={columns}
           rowKey="id"
           size="middle"
@@ -136,7 +158,11 @@ export default function SavedConnectionsModal({
             emptyText: (
               <Empty
                 image={Empty.PRESENTED_IMAGE_SIMPLE}
-                description={<span style={{ color: '#64748b' }}>Belum ada slot database tersimpan di akun Anda.</span>}
+                description={
+                  <span style={{ color: '#64748b' }}>
+                    {searchKw ? `Tidak ada slot yang cocok dengan "${searchKw}"` : 'Belum ada slot database tersimpan di akun Anda.'}
+                  </span>
+                }
               />
             ),
           }}

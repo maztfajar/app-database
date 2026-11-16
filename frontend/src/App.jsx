@@ -3,6 +3,7 @@ import axios from 'axios';
 import {
   Input, Button, Table, Tabs, Modal, message, Form, Typography, Space, Spin, Tooltip,
   Popconfirm, Select, Checkbox, Switch, Tag, Badge, Card, Divider, Row, Col, Segmented, Popover,
+  Alert, notification,
 } from 'antd';
 import {
   DatabaseOutlined, TableOutlined, PlayCircleOutlined,
@@ -21,6 +22,7 @@ import UserHeader from './components/UserHeader';
 import SavedConnectionsModal from './components/SavedConnectionsModal';
 import DatabaseSlotsHub from './components/DatabaseSlotsHub';
 import DatabaseMetricsDashboard from './components/DatabaseMetricsDashboard';
+import GlobalDatabaseSearchModal from './components/GlobalDatabaseSearchModal';
 import { parseDatabaseUri } from './utils/dbUriParser';
 
 const { TextArea } = Input;
@@ -43,17 +45,22 @@ export default function App() {
   const [querySQL, setQuerySQL] = useState('SELECT * FROM your_table LIMIT 10;');
   const [queryResult, setQueryResult] = useState({ columns: [], data: [], rowCount: 0 });
   const [queryTime, setQueryTime] = useState(null);
+  const [queryResultSearch, setQueryResultSearch] = useState('');
+  const [queryScrollFull, setQueryScrollFull] = useState(true);
   const [tableDataCache, setTableDataCache] = useState({});
   const [tableStructure, setTableStructure] = useState({});
   const [loading, setLoading] = useState(false);
   const [queryLoading, setQueryLoading] = useState(false);
   const [searchModalVisible, setSearchModalVisible] = useState(false);
+  const [globalSearchModalVisible, setGlobalSearchModalVisible] = useState(false);
   const [searchKeyword, setSearchKeyword] = useState('');
   const [sidebarSearch, setSidebarSearch] = useState('');
   const [credentials, setCredentials] = useState(null);
   const [connectingStatus, setConnectingStatus] = useState('');
   const [structureCollapsed, setStructureCollapsed] = useState({});
   const [selectedSearchIndex, setSelectedSearchIndex] = useState(0);
+  const [tableDataSearch, setTableDataSearch] = useState({});
+  const [tableScrollModes, setTableScrollModes] = useState({});
 
   // Column order and visibility per table: { [tableName]: string[] }
   const [customColumnOrder, setCustomColumnOrder] = useState(() => {
@@ -397,10 +404,11 @@ export default function App() {
         setTableDataCache({});
         setTableStructure({});
 
+        const firstTable = (res.data.tables && res.data.tables.length > 0) ? res.data.tables[0] : null;
         const nextOpenTabs = (initialTabs && Array.isArray(initialTabs) && initialTabs.length > 0)
           ? initialTabs
-          : ['metrics', 'query'];
-        const nextActiveTab = initialActiveTab || 'metrics';
+          : (firstTable ? ['metrics', firstTable, 'query'] : ['metrics', 'query']);
+        const nextActiveTab = initialActiveTab || (firstTable || 'metrics');
 
         setOpenTabs(nextOpenTabs);
         setActiveTab(nextActiveTab);
@@ -543,7 +551,7 @@ export default function App() {
     if (!creds) return;
     try {
       const res = await axios.post(`${API_URL}/table/data`, {
-        ...creds, tableName, limit: 200,
+        ...creds, tableName, limit: 'all',
       });
       const { rows, fields, total } = res.data;
       const rawColumns = fields.map(f => f.name);
@@ -565,7 +573,8 @@ export default function App() {
         [tableName]: { rawColumns, data: rows, total }
       }));
     } catch (error) {
-      message.error(`Gagal mengambil data: ${tableName}`);
+      const errMsg = error.response?.data?.error || error.message || 'Gagal memanggil data dari server';
+      message.error(`Gagal mengambil data (${tableName}): ${errMsg}`);
     }
   }, [credentials]);
 
@@ -598,6 +607,14 @@ export default function App() {
     if (!tableStructure[tableName]) fetchTableStructure(tableName);
   }, [openTabs, tableDataCache, tableStructure, fetchTableData, fetchTableStructure]);
 
+  // ---------- OPEN TABLE FROM GLOBAL KEYWORD SEARCH ----------
+  const handleSelectTableFromGlobalSearch = useCallback((tableName, kw) => {
+    handleTableClick(tableName);
+    if (kw) {
+      setTableDataSearch(prev => ({ ...prev, [tableName]: kw }));
+    }
+  }, [handleTableClick]);
+
   // ---------- EXECUTE QUERY ----------
   const handleExecuteQuery = useCallback(async () => {
     if (!credentials || !querySQL.trim()) return;
@@ -625,6 +642,16 @@ export default function App() {
       setQueryResult({ columns, data: rows, rowCount: rowCount || rows.length });
       setQueryTime(elapsed.toFixed(0));
       message.success(`Query berhasil — ${rows.length} baris dalam ${elapsed.toFixed(0)}ms`);
+
+      const isModifyingQuery = /^\s*(UPDATE|DELETE|INSERT|DROP|ALTER|TRUNCATE)\b/i.test(querySQL.trim());
+      if (isModifyingQuery) {
+        notification.warning({
+          message: 'Peringatan Perubahan Data',
+          description: 'Query perubahan data telah dieksekusi. Perubahan ini langsung diterapkan di database dan berdampak pada aplikasi yang telah terhubung.',
+          placement: 'topRight',
+          duration: 5,
+        });
+      }
     } catch (error) {
       message.error(error.response?.data?.error || 'Error menjalankan query');
       setQueryTime(null);
@@ -750,6 +777,12 @@ export default function App() {
       });
       if (res.data.success) {
         message.success(`Kolom "${columnName}" berhasil dihapus dari tabel "${activeTab}"`);
+        notification.warning({
+          message: 'Kolom Berhasil Dihapus',
+          description: `Kolom "${columnName}" pada tabel "${activeTab}" telah dihapus permanen. Aplikasi yang terhubung dan mengandalkan kolom ini dapat mengalami kegagalan query.`,
+          placement: 'topRight',
+          duration: 6,
+        });
         fetchTableStructure(activeTab);
         fetchTableData(activeTab);
       }
@@ -786,6 +819,12 @@ export default function App() {
 
       if (res.data.success) {
         message.success(`Nama kolom "${oldColumnName}" berhasil diubah menjadi "${trimmedNew}"`);
+        notification.warning({
+          message: 'Nama Kolom Diubah',
+          description: `Nama kolom "${oldColumnName}" diubah menjadi "${trimmedNew}". Pastikan untuk memperbarui konfigurasi pada aplikasi yang telah terhubung agar tidak terjadi error query.`,
+          placement: 'topRight',
+          duration: 6,
+        });
 
         // Update customColumnOrder if present
         setCustomColumnOrder(prev => {
@@ -833,6 +872,12 @@ export default function App() {
       });
       if (res.data.success) {
         message.success('Baris data baru berhasil ditambahkan');
+        notification.info({
+          message: 'Baris Data Ditambahkan',
+          description: 'Data baru berhasil disimpan ke database dan langsung dapat diakses oleh aplikasi yang telah terhubung.',
+          placement: 'topRight',
+          duration: 4.5,
+        });
         setAddRowModalVisible(false);
         addRowForm.resetFields();
         fetchTableData(activeTab);
@@ -898,6 +943,12 @@ export default function App() {
       });
       if (res.data.success) {
         message.success('Data baris berhasil diperbarui');
+        notification.warning({
+          message: 'Data Berhasil Diperbarui',
+          description: 'Perubahan data telah disimpan ke database utama dan langsung berdampak pada aplikasi yang telah terhubung.',
+          placement: 'topRight',
+          duration: 5,
+        });
         setEditRowModalVisible(false);
         fetchTableData(activeTab);
       }
@@ -926,6 +977,12 @@ export default function App() {
       });
       if (res.data.success) {
         message.success('Baris berhasil dihapus');
+        notification.warning({
+          message: 'Baris Data Dihapus',
+          description: 'Baris data telah dihapus secara permanen dari database. Perubahan ini dapat mempengaruhi alur kerja pada aplikasi yang telah terhubung.',
+          placement: 'topRight',
+          duration: 5,
+        });
         fetchTableData(activeTab);
       }
     } catch (err) {
@@ -942,6 +999,12 @@ export default function App() {
       });
       if (res.data.success) {
         message.success(`Semua data dalam tabel "${tableName}" telah dikosongkan`);
+        notification.warning({
+          message: 'Tabel Dikosongkan (Truncate)',
+          description: `Semua data dalam tabel "${tableName}" telah dihapus. Hal ini berdampak langsung pada seluruh aplikasi yang terhubung.`,
+          placement: 'topRight',
+          duration: 6,
+        });
         fetchTableData(tableName);
       }
     } catch (err) {
@@ -958,6 +1021,12 @@ export default function App() {
       });
       if (res.data.success) {
         message.success(`Tabel "${tableName}" berhasil dihapus`);
+        notification.warning({
+          message: 'Tabel Dihapus (Drop Table)',
+          description: `Tabel "${tableName}" telah dihapus permanen. Aplikasi yang terhubung tidak akan dapat lagi mengakses tabel ini.`,
+          placement: 'topRight',
+          duration: 6,
+        });
         setTables(res.data.tables);
         setOpenTabs(prev => prev.filter(t => t !== tableName));
         setActiveTab('query');
@@ -1096,6 +1165,10 @@ export default function App() {
         setSearchKeyword('');
         setSelectedSearchIndex(0);
       }
+      if ((e.ctrlKey || e.metaKey) && (e.shiftKey && (e.key === 'F' || e.key === 'f'))) {
+        e.preventDefault();
+        setGlobalSearchModalVisible(true);
+      }
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter' && activeTab === 'query') {
         e.preventDefault();
         handleExecuteQuery();
@@ -1220,27 +1293,60 @@ export default function App() {
         )}
       </div>
       <div className="query-result-section">
-        {queryResult.columns.length > 0 && (
-          <>
-            <div className="query-result-info">
-              <span className="query-result-badge">
-                {queryResult.data.length} rows
-              </span>
-              {queryTime && (
-                <span style={{ color: '#5c6070' }}>⏱ {queryTime}ms</span>
-              )}
-            </div>
-            <Table
-              columns={queryResult.columns}
-              dataSource={queryResult.data}
-              rowKey={(_, index) => index}
-              scroll={{ x: 'max-content' }}
-              pagination={{ pageSize: 50, size: 'small', showSizeChanger: true, pageSizeOptions: [20, 50, 100] }}
-              size="small"
-              bordered
-            />
-          </>
-        )}
+        {queryResult.columns.length > 0 && (() => {
+          const qKw = queryResultSearch.trim().toLowerCase();
+          const filteredQueryData = qKw
+            ? queryResult.data.filter(row =>
+                Object.values(row).some(val =>
+                  val !== null && val !== undefined && String(val).toLowerCase().includes(qKw)
+                )
+              )
+            : queryResult.data;
+
+          return (
+            <>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+                <div className="query-result-info" style={{ marginBottom: 0 }}>
+                  <span className="query-result-badge">
+                    {filteredQueryData.length} baris {qKw ? `(dari ${queryResult.data.length})` : ''}
+                  </span>
+                  {queryTime && (
+                    <span style={{ color: '#5c6070' }}>⏱ {queryTime}ms</span>
+                  )}
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <Input
+                    placeholder="🔍 Filter hasil query..."
+                    allowClear
+                    value={queryResultSearch}
+                    onChange={(e) => setQueryResultSearch(e.target.value)}
+                    style={{ width: 220, borderRadius: 6 }}
+                    prefix={<SearchOutlined style={{ color: '#8b8fa3' }} />}
+                  />
+                  <Segmented
+                    size="small"
+                    value={queryScrollFull ? 'scroll' : 'paged'}
+                    onChange={(val) => setQueryScrollFull(val === 'scroll')}
+                    options={[
+                      { label: '📜 Scroll Penuh', value: 'scroll' },
+                      { label: '📄 Paginasi', value: 'paged' },
+                    ]}
+                  />
+                </div>
+              </div>
+              <Table
+                columns={queryResult.columns}
+                dataSource={filteredQueryData}
+                rowKey={(_, index) => index}
+                scroll={{ x: 'max-content', y: queryScrollFull ? 'calc(100vh - 380px)' : undefined }}
+                pagination={queryScrollFull ? false : { pageSize: 50, size: 'small', showSizeChanger: true, pageSizeOptions: [20, 50, 100, 200, 500] }}
+                size="small"
+                bordered
+              />
+            </>
+          );
+        })()}
         {queryResult.columns.length === 0 && !queryLoading && (
           <div className="empty-state">
             <CodeOutlined />
@@ -1256,7 +1362,7 @@ export default function App() {
   const renderTableTab = (tableName) => {
     const data = tableDataCache[tableName];
     const structure = tableStructure[tableName];
-    const isStructureCollapsed = structureCollapsed[tableName];
+    const isStructureCollapsed = structureCollapsed[tableName] !== undefined ? structureCollapsed[tableName] : true;
 
     const currentOrder = customColumnOrder[tableName] || data?.rawColumns || [];
     const hidden = hiddenColumns[tableName] || [];
@@ -1294,9 +1400,12 @@ export default function App() {
               <span style={{ display: 'inline-flex', gap: 2, marginLeft: 'auto', alignItems: 'center' }}>
                 <Popover
                   content={
-                    <div style={{ width: 230, padding: 4 }}>
+                    <div style={{ width: 240, padding: 4 }}>
                       <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4, color: '#0f172a' }}>
                         ✏️ Ubah Nama Kolom
+                      </div>
+                      <div style={{ fontSize: 11, color: '#b45309', marginBottom: 8, background: '#fffbeb', padding: '4px 8px', borderRadius: 4, border: '1px solid #fde68a' }}>
+                        ⚠️ Perubahan nama kolom langsung berdampak pada query aplikasi terhubung!
                       </div>
                       <div style={{ fontSize: 11, color: '#64748b', marginBottom: 8 }}>
                         Kolom: <Tag color="purple">{colKey}</Tag>
@@ -1409,6 +1518,12 @@ export default function App() {
             </Tooltip>
             <Popconfirm
               title="Hapus baris ini?"
+              description={
+                <div style={{ maxWidth: 280 }}>
+                  <p style={{ margin: '0 0 4px 0', color: '#ff4d4f', fontWeight: 600 }}>⚠️ Peringatan Dampak:</p>
+                  <p style={{ margin: 0, fontSize: 12 }}>Penghapusan data ini permanen dan akan berdampak langsung pada aplikasi yang telah terhubung.</p>
+                </div>
+              }
               okText="Hapus"
               cancelText="Batal"
               okType="danger"
@@ -1463,7 +1578,7 @@ export default function App() {
             )}
             <Popconfirm
               title={`Kosongkan semua data tabel "${tableName}"?`}
-              description="Aksi ini akan menghapus semua record di dalam tabel."
+              description="PERINGATAN: Aksi ini akan menghapus semua record di dalam tabel dan berdampak langsung pada aplikasi yang telah terhubung!"
               okText="Kosongkan"
               cancelText="Batal"
               okType="danger"
@@ -1475,7 +1590,7 @@ export default function App() {
             </Popconfirm>
             <Popconfirm
               title={`Hapus tabel "${tableName}" secara permanen?`}
-              description="Aksi ini tidak dapat dibatalkan!"
+              description="PERINGATAN KRITIS: Tabel akan dihapus total! Aplikasi yang terhubung akan mengalami error saat mengakses tabel ini."
               okText="Hapus Tabel"
               cancelText="Batal"
               okType="danger"
@@ -1487,6 +1602,16 @@ export default function App() {
             </Popconfirm>
           </div>
         </div>
+
+        {/* Global Warning Alert Banner */}
+        <Alert
+          message="Peringatan Perubahan Data"
+          description="Perubahan data (tambah baris, edit data, hapus, truncate) yang dilakukan pada tabel ini akan langsung tersimpan ke database utama dan berdampak pada seluruh aplikasi yang telah terhubung."
+          type="warning"
+          showIcon
+          closable
+          style={{ marginBottom: 14, borderRadius: 8 }}
+        />
 
         {/* Action Toolbar Strip */}
         <div className="table-toolbar-strip">
@@ -1623,7 +1748,7 @@ export default function App() {
                       </Tooltip>
                       <Popconfirm
                         title={`Hapus kolom "${record.column_name}"?`}
-                        description="Data pada kolom ini akan terhapus permanen."
+                        description="PERINGATAN: Data pada kolom ini akan terhapus permanen dan berdampak langsung pada query aplikasi yang telah terhubung!"
                         okText="Hapus Kolom"
                         cancelText="Batal"
                         okType="danger"
@@ -1654,25 +1779,74 @@ export default function App() {
         </div>
 
         {/* Data section */}
-        <div className="data-section">
-          <div className="section-label">
-            <TableOutlined />
-            <span>Data Records</span>
-          </div>
-          {data ? (
-            <Table
-              columns={tableDisplayColumns}
-              dataSource={data.data}
-              rowKey={(_, index) => index}
-              scroll={{ x: 'max-content' }}
-              pagination={{ pageSize: 50, size: 'small', showSizeChanger: true, pageSizeOptions: [20, 50, 100, 200] }}
-              size="small"
-              bordered
-            />
-          ) : (
-            <div className="loading-overlay"><Spin size="small" /> <span style={{ marginLeft: 8 }}>Loading data...</span></div>
-          )}
-        </div>
+        {(() => {
+          const searchKw = (tableDataSearch[tableName] || '').trim().toLowerCase();
+          const rawRows = data ? data.data : [];
+          const filteredData = searchKw
+            ? rawRows.filter(row =>
+                Object.values(row).some(val =>
+                  val !== null && val !== undefined && String(val).toLowerCase().includes(searchKw)
+                )
+              )
+            : rawRows;
+          const isScrollFull = tableScrollModes[tableName] !== false;
+
+          return (
+            <div className="data-section">
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div className="section-label" style={{ marginBottom: 0 }}>
+                    <TableOutlined />
+                    <span>Data Records</span>
+                  </div>
+                  {data && (
+                    <Tag color="geekblue" style={{ borderRadius: 12, fontWeight: 600, fontSize: 12 }}>
+                      {filteredData.length} baris {searchKw ? `(ditemukan dari ${data.data.length})` : 'dimuat'}
+                    </Tag>
+                  )}
+                </div>
+
+                {/* Keyword Search & Scroll Mode Toggle */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <Input
+                    placeholder="🔍 Cari kata kunci di seluruh kolom..."
+                    allowClear
+                    value={tableDataSearch[tableName] || ''}
+                    onChange={(e) => setTableDataSearch(prev => ({ ...prev, [tableName]: e.target.value }))}
+                    style={{ width: 280, borderRadius: 6 }}
+                    prefix={<SearchOutlined style={{ color: '#8b8fa3' }} />}
+                  />
+                  <Tooltip title={isScrollFull ? 'Mode Scroll Penuh: Menampilkan semua data dalam satu guliran sampai baris terakhir' : 'Mode Paginasi: Membagi data ke dalam halaman'}>
+                    <Segmented
+                      size="small"
+                      value={isScrollFull ? 'scroll' : 'paged'}
+                      onChange={(val) => setTableScrollModes(prev => ({ ...prev, [tableName]: val === 'scroll' }))}
+                      options={[
+                        { label: '📜 Scroll Penuh', value: 'scroll' },
+                        { label: '📄 Paginasi', value: 'paged' },
+                      ]}
+                    />
+                  </Tooltip>
+                </div>
+              </div>
+
+              {data ? (
+                <Table
+                  columns={tableDisplayColumns}
+                  dataSource={filteredData}
+                  rowKey={(_, index) => index}
+                  scroll={{ x: 'max-content', y: isScrollFull ? 'calc(100vh - 310px)' : undefined }}
+                  pagination={isScrollFull ? false : { pageSize: 50, size: 'small', showSizeChanger: true, pageSizeOptions: [20, 50, 100, 200, 500, 1000] }}
+                  size="small"
+                  bordered
+                  style={{ minHeight: isScrollFull ? 450 : undefined }}
+                />
+              ) : (
+                <div className="loading-overlay"><Spin size="small" /> <span style={{ marginLeft: 8 }}>Loading data...</span></div>
+              )}
+            </div>
+          );
+        })()}
       </div>
     );
   };
@@ -1757,7 +1931,17 @@ export default function App() {
               Ganti Database
             </Button>
           </Tooltip>
-          <span className="header-shortcut-hint">Ctrl+P Search</span>
+          <Button
+            size="small"
+            type="primary"
+            icon={<SearchOutlined />}
+            onClick={() => setGlobalSearchModalVisible(true)}
+            style={{ borderRadius: 6, fontWeight: 500, background: '#4f46e5', borderColor: '#4f46e5' }}
+          >
+            Pencarian Database
+          </Button>
+          <span className="header-shortcut-hint">Ctrl+P Tabel</span>
+          <span className="header-shortcut-hint">Ctrl+Shift+F Cari</span>
           <UserHeader
             user={currentUser}
             onLogout={handleLogout}
@@ -1789,6 +1973,13 @@ export default function App() {
             >
               <DashboardOutlined style={{ color: '#4f46e5', fontSize: 14 }} />
               <span>Ringkasan & Metrik</span>
+            </div>
+            <div
+              className={`sidebar-nav-item`}
+              onClick={() => setGlobalSearchModalVisible(true)}
+            >
+              <SearchOutlined style={{ color: '#ec4899', fontSize: 14 }} />
+              <span>Pencarian Database</span>
             </div>
             <div
               className={`sidebar-nav-item ${activeTab === 'query' ? 'active' : ''}`}
@@ -2111,6 +2302,13 @@ export default function App() {
         okButtonProps={{ style: { background: '#7c3aed', borderColor: '#7c3aed' } }}
         destroyOnClose
       >
+        <Alert
+          message="Peringatan Kritis"
+          description="Mengubah nama kolom pada database fisik dapat menyebabkan query atau integrasi pada aplikasi yang telah terhubung mengalami kegagalan/error jika kolom lama masih diakses."
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
         <div style={{ marginBottom: 16, background: '#f8fafc', padding: '10px 14px', borderRadius: 8, border: '1px solid #e2e8f0' }}>
           <Text style={{ fontSize: 12, color: '#64748b', display: 'block', marginBottom: 4 }}>
             Tabel: <b style={{ color: '#0f172a' }}>{renamingColumn.tableName || activeTab}</b>
@@ -2247,6 +2445,13 @@ export default function App() {
         destroyOnClose
         width={560}
       >
+        <Alert
+          message="Perhatian: Dampak Aplikasi Terhubung"
+          description="Data baru yang ditambahkan akan langsung tersimpan di database dan dapat segera diakses oleh seluruh aplikasi yang terhubung."
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
         <Form form={addRowForm} layout="vertical" onFinish={handleAddRowSubmit}>
           <div style={{ maxHeight: 400, overflowY: 'auto', paddingRight: 6 }}>
             {currentActiveStructure.map((col) => (
@@ -2289,6 +2494,13 @@ export default function App() {
         destroyOnClose
         width={560}
       >
+        <Alert
+          message="Peringatan: Dampak Aplikasi Terhubung"
+          description="Perubahan data pada baris ini akan langsung tersimpan ke database utama dan dapat berdampak langsung pada fungsionalitas aplikasi atau layanan lain yang telah terhubung."
+          type="warning"
+          showIcon
+          style={{ marginBottom: 16 }}
+        />
         <Form form={editRowForm} layout="vertical" onFinish={handleEditRowSubmit}>
           <div style={{ maxHeight: 400, overflowY: 'auto', paddingRight: 6 }}>
             {currentActiveStructure.map((col) => (
@@ -2373,6 +2585,14 @@ export default function App() {
           setSavedConnectionsModalVisible(false);
           setIsConnected(false);
         }}
+      />
+
+      {/* Modal Pencarian Database Global (Kata Kunci) */}
+      <GlobalDatabaseSearchModal
+        visible={globalSearchModalVisible}
+        onClose={() => setGlobalSearchModalVisible(false)}
+        credentials={credentials}
+        onSelectTable={handleSelectTableFromGlobalSearch}
       />
     </div>
   );

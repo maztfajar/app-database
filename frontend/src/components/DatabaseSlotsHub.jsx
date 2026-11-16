@@ -253,11 +253,14 @@ export default function DatabaseSlotsHub({
 
   const filteredSlots = slots.filter((s) => {
     const matchesType = filterType === 'all' || (s.type || 'postgres').toLowerCase() === filterType.toLowerCase();
-    const q = searchQuery.toLowerCase();
+    const q = searchQuery.toLowerCase().trim();
     const matchesSearch = !q ||
       (s.name && s.name.toLowerCase().includes(q)) ||
       (s.database_name && s.database_name.toLowerCase().includes(q)) ||
-      (s.host && s.host.toLowerCase().includes(q));
+      (s.host && s.host.toLowerCase().includes(q)) ||
+      (s.username && s.username.toLowerCase().includes(q)) ||
+      (s.type && s.type.toLowerCase().includes(q)) ||
+      (s.port && String(s.port).includes(q));
     return matchesType && matchesSearch;
   });
 
@@ -357,6 +360,12 @@ export default function DatabaseSlotsHub({
             ]}
             style={{ background: '#f1f5f9', padding: 3, borderRadius: 8 }}
           />
+
+          {searchQuery && (
+            <Tag color="indigo" style={{ borderRadius: 6, fontWeight: 600, padding: '2px 8px' }}>
+              🔍 {filteredSlots.length} dari {slots.length} slot cocok
+            </Tag>
+          )}
 
           <Button
             icon={<ReloadOutlined />}

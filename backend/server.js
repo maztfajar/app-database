@@ -312,10 +312,14 @@ class SQLiteAdapter {
     }));
   }
 
-  getTableData(tableName, limit = 200, offset = 0) {
+  getTableData(tableName, limit = 'all', offset = 0) {
     const total = this.db.prepare(`SELECT COUNT(*) as c FROM "${tableName}"`).get().c;
-    const stmt = this.db.prepare(`SELECT * FROM "${tableName}" LIMIT ? OFFSET ?`);
-    const rows = stmt.all(limit, offset);
+    const isAll = limit === 'all' || limit === 0 || limit === -1 || !limit;
+    const sql = isAll
+      ? `SELECT * FROM "${tableName}"`
+      : `SELECT * FROM "${tableName}" LIMIT ? OFFSET ?`;
+    const stmt = this.db.prepare(sql);
+    const rows = isAll ? stmt.all() : stmt.all(parseInt(limit), parseInt(offset));
     const columns = stmt.columns();
     const fields = columns.map(c => ({ name: c.name }));
     return { rows, fields, total };
@@ -373,7 +377,7 @@ class MySQLAdapter {
     }));
   }
 
-  async getTableData(tableName, limit = 200, offset = 0, orderBy, orderDir = 'ASC') {
+  async getTableData(tableName, limit = 'all', offset = 0, orderBy, orderDir = 'ASC') {
     const [countResult] = await this.pool.query(
       `SELECT COUNT(*) as c FROM \`${tableName}\``
     );
@@ -385,9 +389,11 @@ class MySQLAdapter {
       orderSql = `ORDER BY \`${orderBy}\` ${safeDir}`;
     }
 
+    const isAll = limit === 'all' || limit === 0 || limit === -1 || !limit;
+    const limitClause = isAll ? '' : `LIMIT ${parseInt(limit)} OFFSET ${parseInt(offset)}`;
+
     const [rows, fields] = await this.pool.query(
-      `SELECT * FROM \`${tableName}\` ${orderSql} LIMIT ? OFFSET ?`,
-      [parseInt(limit), parseInt(offset)]
+      `SELECT * FROM \`${tableName}\` ${orderSql} ${limitClause}`
     );
     const fieldList = (fields || []).map(f => ({ name: f.name }));
     return { rows, fields: fieldList, total };
@@ -900,6 +906,100 @@ app.post('/api/database/metrics', requireAuth, getConnection, async (req, res) =
   }
 });
 
+// ---------- GLOBAL DATABASE KEYWORD SEARCH ----------
+app.post('/api/database/search', requireAuth, getConnection, async (req, res) => {
+  const { keyword, maxRowsPerTable = 30 } = req.body;
+  if (!keyword || !keyword.trim()) {
+    return res.status(400).json({ error: 'Kata kunci pencarian diperlukan' });
+  }
+
+  const kw = keyword.trim();
+  const conn = req.conn;
+  const results = [];
+
+  try {
+    let tableNames = conn.tables || [];
+    if (!tableNames || tableNames.length === 0) {
+      if (conn.type === 'sqlite') {
+        tableNames = conn.adapter.getTables();
+      } else if (conn.type === 'mysql') {
+        tableNames = await conn.adapter.getTables();
+      } else if (conn.type === 'pg') {
+        const tr = await conn.pool.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name");
+        tableNames = tr.rows.map(r => r.table_name);
+      }
+      conn.tables = tableNames;
+    }
+
+    for (const tableName of tableNames) {
+      try {
+        if (conn.type === 'sqlite') {
+          const struct = conn.adapter.getTableStructure(tableName);
+          if (!struct || struct.length === 0) continue;
+          const conditions = struct.map(c => `CAST("${c.column_name}" AS TEXT) LIKE ?`).join(' OR ');
+          const params = struct.map(() => `%${kw}%`);
+          const sql = `SELECT * FROM "${tableName}" WHERE ${conditions} LIMIT ?`;
+          const stmt = conn.adapter.db.prepare(sql);
+          const matched = stmt.all(...params, parseInt(maxRowsPerTable));
+          if (matched && matched.length > 0) {
+            results.push({
+              tableName,
+              matchedRows: matched,
+              matchCount: matched.length,
+            });
+          }
+        } else if (conn.type === 'mysql') {
+          const struct = await conn.adapter.getTableStructure(tableName);
+          if (!struct || struct.length === 0) continue;
+          const cols = struct.map(c => `COALESCE(\`${c.column_name}\`, '')`).join(", ' ', ");
+          const sql = `SELECT * FROM \`${tableName}\` WHERE CONCAT_WS(' ', ${cols}) LIKE ? LIMIT ?`;
+          const [matched] = await conn.adapter.pool.query(sql, [`%${kw}%`, parseInt(maxRowsPerTable)]);
+          if (matched && matched.length > 0) {
+            results.push({
+              tableName,
+              matchedRows: matched,
+              matchCount: matched.length,
+            });
+          }
+        } else if (conn.type === 'pg') {
+          const colsRes = await conn.pool.query(`
+            SELECT column_name 
+            FROM information_schema.columns 
+            WHERE table_schema = 'public' AND table_name = $1
+            ORDER BY ordinal_position
+          `, [tableName]);
+          const cols = colsRes.rows;
+          if (cols.length === 0) continue;
+          const conditions = cols.map(c => `CAST("${c.column_name}" AS TEXT) ILIKE $1`).join(' OR ');
+          const sql = `SELECT * FROM "${tableName}" WHERE ${conditions} LIMIT $2`;
+          const qr = await conn.pool.query(sql, [`%${kw}%`, parseInt(maxRowsPerTable)]);
+          if (qr.rows && qr.rows.length > 0) {
+            results.push({
+              tableName,
+              matchedRows: qr.rows,
+              matchCount: qr.rows.length,
+            });
+          }
+        }
+      } catch (tableErr) {
+        console.warn(`Search skipped for table ${tableName}:`, tableErr.message);
+      }
+    }
+
+    const totalFound = results.reduce((sum, r) => sum + r.matchCount, 0);
+    res.json({
+      success: true,
+      keyword: kw,
+      totalFound,
+      totalTablesWithMatches: results.length,
+      results,
+    });
+  } catch (err) {
+    console.error('Database Search Error:', err);
+    res.status(500).json({ error: 'Pencarian database gagal: ' + err.message });
+  }
+});
+
 // ---------- MIDDLEWARE ----------
 function getConnection(req, res, next) {
   let { host, port, database, user, password, connection_string, connectionString, uri } = req.body;
@@ -994,7 +1094,7 @@ app.post('/api/table', requireAuth, getConnection, async (req, res) => {
 
 // ---------- TABLE DATA ----------
 app.post('/api/table/data', requireAuth, getConnection, async (req, res) => {
-  const { tableName, limit = 200, offset = 0, orderBy, orderDir = 'ASC' } = req.body;
+  const { tableName, limit = 'all', offset = 0, orderBy, orderDir = 'ASC' } = req.body;
   if (!tableName) return res.status(400).json({ error: 'Nama tabel diperlukan' });
   try {
     if (req.conn.type === 'sqlite') {
@@ -1031,10 +1131,15 @@ app.post('/api/table/data', requireAuth, getConnection, async (req, res) => {
       }
     }
 
-    const result = await req.conn.pool.query(
-      `SELECT * FROM "${tableName}" ${orderClause} LIMIT $1 OFFSET $2`,
-      [limit, offset]
-    );
+    const isAll = limit === 'all' || limit === 0 || limit === -1 || !limit;
+    let querySql = `SELECT * FROM "${tableName}" ${orderClause}`;
+    let params = [];
+    if (!isAll) {
+      querySql += ` LIMIT $1 OFFSET $2`;
+      params = [parseInt(limit), parseInt(offset)];
+    }
+
+    const result = await req.conn.pool.query(querySql, params);
     const fields = result.fields ? result.fields.map(f => ({ name: f.name })) : [];
     res.json({ rows: result.rows, fields, total });
   } catch (err) {
@@ -1047,6 +1152,11 @@ app.post('/api/tables', requireAuth, getConnection, async (req, res) => {
   try {
     if (req.conn.type === 'sqlite') {
       const tables = req.conn.adapter.getTables();
+      req.conn.tables = tables;
+      return res.json({ tables });
+    }
+    if (req.conn.type === 'mysql') {
+      const tables = await req.conn.adapter.getTables();
       req.conn.tables = tables;
       return res.json({ tables });
     }
@@ -1402,12 +1512,19 @@ app.post('/api/table/drop', requireAuth, getConnection, async (req, res) => {
   const { tableName } = req.body;
   if (!tableName) return res.status(400).json({ error: 'tableName diperlukan' });
   try {
-    const sql = `DROP TABLE IF EXISTS "${tableName}"`;
     if (req.conn.type === 'sqlite') {
+      const sql = `DROP TABLE IF EXISTS "${tableName}"`;
       req.conn.adapter.db.exec(sql);
       req.conn.tables = req.conn.adapter.getTables();
       return res.json({ success: true, tables: req.conn.tables });
     }
+    if (req.conn.type === 'mysql') {
+      const sql = `DROP TABLE IF EXISTS \`${tableName}\``;
+      await req.conn.pool.query(sql);
+      req.conn.tables = await req.conn.adapter.getTables();
+      return res.json({ success: true, tables: req.conn.tables });
+    }
+    const sql = `DROP TABLE IF EXISTS "${tableName}"`;
     await req.conn.pool.query(sql);
     const tablesResult = await req.conn.pool.query(`
       SELECT table_name FROM information_schema.tables
@@ -1523,6 +1640,10 @@ app.post('/api/table/truncate', requireAuth, getConnection, async (req, res) => 
   try {
     if (req.conn.type === 'sqlite') {
       req.conn.adapter.db.exec(`DELETE FROM "${tableName}"`);
+      return res.json({ success: true });
+    }
+    if (req.conn.type === 'mysql') {
+      await req.conn.pool.query(`TRUNCATE TABLE \`${tableName}\``);
       return res.json({ success: true });
     }
     await req.conn.pool.query(`TRUNCATE TABLE "${tableName}" RESTART IDENTITY`);
