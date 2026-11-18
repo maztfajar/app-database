@@ -4,11 +4,11 @@ import { message, Progress } from 'antd';
 import AICircuitBackground from './AICircuitBackground';
 
 export default function AuthPortal({ onAuthSuccess }) {
-  // Modes: 'login' | 'register' | 'forgot' | 'reset' | 'verify'
+  // Modes: 'login' | 'register' | 'forgot'
   const [authMode, setAuthMode] = useState('login');
   const [loading, setLoading] = useState(false);
 
-  // Form input states
+  // Login input states
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -21,27 +21,16 @@ export default function AuthPortal({ onAuthSuccess }) {
   const [showRegisterPassword, setShowRegisterPassword] = useState(false);
   const [passwordStrength, setPasswordStrength] = useState(0);
 
-  // Forgot password input states
-  const [forgotEmail, setForgotEmail] = useState('');
-
-  // Reset password input states
-  const [resetCode, setResetCode] = useState('');
+  // Local Reset password input states
+  const [resetEmail, setResetEmail] = useState('');
   const [resetPassword, setResetPassword] = useState('');
   const [resetConfirmPassword, setResetConfirmPassword] = useState('');
   const [showResetPassword, setShowResetPassword] = useState(false);
 
-  // Verification & Reset states
-  const [targetEmail, setTargetEmail] = useState('');
-  const [targetName, setTargetName] = useState('');
-  const [otpCode, setOtpCode] = useState('');
-  const [countdown, setCountdown] = useState(60);
-  const [canResend, setCanResend] = useState(false);
-  const [devOtp, setDevOtp] = useState('');
-  const [remainingAttempts, setRemainingAttempts] = useState(5);
-
   // Floating Toast State (from logout or initial info toast)
   const [showToast, setShowToast] = useState(() => {
-    return sessionStorage.getItem('appdb_toast_dismissed') !== 'true';
+    return sessionStorage.getItem('appdb_logout_toast') === 'true' &&
+      sessionStorage.getItem('appdb_toast_dismissed') !== 'true';
   });
 
   useEffect(() => {
@@ -59,23 +48,6 @@ export default function AuthPortal({ onAuthSuccess }) {
     sessionStorage.removeItem('appdb_logout_toast');
   };
 
-  // Countdown timer for OTP
-  useEffect(() => {
-    let timer;
-    if ((authMode === 'verify' || authMode === 'reset') && countdown > 0) {
-      timer = setInterval(() => {
-        setCountdown((prev) => {
-          if (prev <= 1) {
-            setCanResend(true);
-            return 0;
-          }
-          return prev - 1;
-        });
-      }, 1000);
-    }
-    return () => clearInterval(timer);
-  }, [authMode, countdown]);
-
   // Password strength calculation
   const handlePasswordStrength = (val) => {
     setRegisterPassword(val);
@@ -84,8 +56,8 @@ export default function AuthPortal({ onAuthSuccess }) {
       setPasswordStrength(0);
       return;
     }
-    if (val.length >= 8) score += 30;
-    if (val.length >= 12) score += 20;
+    if (val.length >= 6) score += 30;
+    if (val.length >= 10) score += 20;
     if (/[A-Z]/.test(val)) score += 20;
     if (/[0-9]/.test(val)) score += 15;
     if (/[^A-Za-z0-9]/.test(val)) score += 15;
@@ -93,12 +65,12 @@ export default function AuthPortal({ onAuthSuccess }) {
   };
 
   // ---------------------------------------------------------------------------
-  // 1. LOGIN HANDLER
+  // 1. LOCAL LOGIN HANDLER
   // ---------------------------------------------------------------------------
   const handleLoginSubmit = async (e) => {
     e.preventDefault();
     if (!loginEmail.trim() || !loginPassword) {
-      message.warning('Harap masukkan email dan kata sandi Anda.');
+      message.warning('Harap masukkan username/email dan kata sandi Anda.');
       return;
     }
 
@@ -117,23 +89,14 @@ export default function AuthPortal({ onAuthSuccess }) {
       }
     } catch (err) {
       const data = err.response?.data;
-      if (data?.needsVerification) {
-        message.warning('Akun Anda belum diverifikasi. Masukkan kode verifikasi.');
-        setTargetEmail(data.email || loginEmail.trim());
-        setDevOtp(data.devOtp || '');
-        setCountdown(60);
-        setCanResend(false);
-        setAuthMode('verify');
-      } else {
-        message.error(data?.error || 'Gagal masuk. Periksa email dan kata sandi Anda.');
-      }
+      message.error(data?.error || 'Gagal masuk. Periksa username/email dan kata sandi Anda.');
     } finally {
       setLoading(false);
     }
   };
 
   // ---------------------------------------------------------------------------
-  // 2. REGISTER HANDLER
+  // 2. LOCAL REGISTER HANDLER (Langsung Aktif Tanpa OTP / Google)
   // ---------------------------------------------------------------------------
   const handleRegisterSubmit = async (e) => {
     e.preventDefault();
@@ -141,8 +104,12 @@ export default function AuthPortal({ onAuthSuccess }) {
       message.warning('Harap lengkapi semua kolom pendaftaran.');
       return;
     }
-    if (registerPassword.length < 8) {
-      message.error('Kata sandi minimal harus 8 karakter!');
+    if (registerEmail.trim().length < 3 || /\s/.test(registerEmail.trim())) {
+      message.error('Username atau email minimal 3 karakter dan tanpa spasi.');
+      return;
+    }
+    if (registerPassword.length < 6) {
+      message.error('Kata sandi minimal harus 6 karakter!');
       return;
     }
     if (registerPassword !== registerConfirmPassword) {
@@ -158,15 +125,11 @@ export default function AuthPortal({ onAuthSuccess }) {
         password: registerPassword,
       });
 
-      if (res.data.success) {
-        message.success(res.data.message || 'Kode verifikasi telah dikirim ke email Anda!');
-        setTargetEmail(registerEmail.trim());
-        setTargetName(registerName.trim());
-        setDevOtp(res.data.devOtp || '');
-        setCountdown(60);
-        setCanResend(false);
-        setRemainingAttempts(5);
-        setAuthMode('verify');
+      if (res.data.success && res.data.token) {
+        localStorage.setItem('appdb_jwt_token', res.data.token);
+        sessionStorage.removeItem('appdb_logout_toast');
+        message.success(res.data.message || 'Akun lokal berhasil dibuat!');
+        onAuthSuccess(res.data.user, res.data.token);
       }
     } catch (err) {
       message.error(err.response?.data?.error || 'Pendaftaran gagal. Silakan coba lagi.');
@@ -176,79 +139,16 @@ export default function AuthPortal({ onAuthSuccess }) {
   };
 
   // ---------------------------------------------------------------------------
-  // 3. VERIFY REGISTRATION OTP HANDLER
+  // 3. LOCAL PASSWORD RESET HANDLER (Langsung Tanpa Email OTP)
   // ---------------------------------------------------------------------------
-  const handleVerifyOtpSubmit = async (e) => {
+  const handleResetPasswordLocalSubmit = async (e) => {
     e.preventDefault();
-    if (!otpCode || otpCode.trim().length !== 6) {
-      message.warning('Harap masukkan 6 digit kode verifikasi.');
+    if (!resetEmail.trim()) {
+      message.warning('Harap masukkan username atau email terdaftar Anda.');
       return;
     }
-
-    setLoading(true);
-    try {
-      const res = await axios.post('/api/auth/verify-otp', {
-        email: targetEmail,
-        code: otpCode.trim(),
-      });
-
-      if (res.data.success && res.data.token) {
-        localStorage.setItem('appdb_jwt_token', res.data.token);
-        sessionStorage.removeItem('appdb_logout_toast');
-        message.success('Verifikasi berhasil! Akun Anda telah aktif.');
-        onAuthSuccess(res.data.user, res.data.token);
-      }
-    } catch (err) {
-      const data = err.response?.data;
-      if (data?.remainingAttempts !== undefined) {
-        setRemainingAttempts(data.remainingAttempts);
-      }
-      message.error(data?.error || 'Kode verifikasi salah atau kedaluwarsa.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // ---------------------------------------------------------------------------
-  // 4. FORGOT PASSWORD: REQUEST RESET OTP
-  // ---------------------------------------------------------------------------
-  const handleForgotPasswordSubmit = async (e) => {
-    e.preventDefault();
-    if (!forgotEmail.trim()) {
-      message.warning('Harap masukkan alamat email Anda.');
-      return;
-    }
-
-    setLoading(true);
-    try {
-      const res = await axios.post('/api/auth/forgot-password', { email: forgotEmail.trim() });
-      if (res.data.success) {
-        message.success(res.data.message);
-        setTargetEmail(forgotEmail.trim());
-        setDevOtp(res.data.devOtp || '');
-        setCountdown(60);
-        setCanResend(false);
-        setResetCode('');
-        setAuthMode('reset');
-      }
-    } catch (err) {
-      message.error(err.response?.data?.error || 'Gagal memproses permintaan reset kata sandi.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // ---------------------------------------------------------------------------
-  // 5. RESET PASSWORD: VERIFY OTP AND SAVE NEW PASSWORD
-  // ---------------------------------------------------------------------------
-  const handleResetPasswordSubmit = async (e) => {
-    e.preventDefault();
-    if (!resetCode.trim()) {
-      message.warning('Harap masukkan kode verifikasi 6 digit.');
-      return;
-    }
-    if (resetPassword.length < 8) {
-      message.error('Kata sandi baru minimal 8 karakter!');
+    if (resetPassword.length < 6) {
+      message.error('Kata sandi baru minimal 6 karakter!');
       return;
     }
     if (resetPassword !== resetConfirmPassword) {
@@ -258,16 +158,17 @@ export default function AuthPortal({ onAuthSuccess }) {
 
     setLoading(true);
     try {
-      const res = await axios.post('/api/auth/reset-password', {
-        email: targetEmail,
-        code: resetCode.trim(),
+      const res = await axios.post('/api/auth/reset-password-local', {
+        email: resetEmail.trim(),
         newPassword: resetPassword,
       });
 
       if (res.data.success) {
         message.success(res.data.message || 'Kata sandi berhasil diperbarui! Silakan masuk.');
-        setLoginEmail(targetEmail);
+        setLoginEmail(resetEmail.trim());
         setLoginPassword('');
+        setResetPassword('');
+        setResetConfirmPassword('');
         setAuthMode('login');
       }
     } catch (err) {
@@ -277,63 +178,10 @@ export default function AuthPortal({ onAuthSuccess }) {
     }
   };
 
-  // ---------------------------------------------------------------------------
-  // 6. RESEND OTP HANDLER
-  // ---------------------------------------------------------------------------
-  const handleResendOtp = async () => {
-    if (!canResend) return;
-    setLoading(true);
-    try {
-      const endpoint = authMode === 'reset' ? '/api/auth/forgot-password' : '/api/auth/resend-otp';
-      const res = await axios.post(endpoint, { email: targetEmail });
-      if (res.data.success) {
-        message.success('Kode verifikasi baru telah dikirimkan.');
-        setDevOtp(res.data.devOtp || '');
-        setCountdown(60);
-        setCanResend(false);
-        setOtpCode('');
-      }
-    } catch (err) {
-      message.error(err.response?.data?.error || 'Gagal mengirim ulang kode.');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // ---------------------------------------------------------------------------
-  // 7. GOOGLE SIGN-IN HANDLER
-  // ---------------------------------------------------------------------------
-  const handleGoogleAuth = async () => {
-    const defaultEmail = prompt(
-      'Masuk menggunakan Akun Google:\nMasukkan alamat email Google / Gmail Anda:',
-      'user.google@gmail.com'
-    );
-
-    if (!defaultEmail) return;
-
-    setLoading(true);
-    try {
-      const defaultName = defaultEmail.split('@')[0].replace('.', ' ').replace(/(^\w|\s\w)/g, m => m.toUpperCase());
-      const res = await axios.post('/api/auth/google', {
-        profile: {
-          email: defaultEmail,
-          name: defaultName || 'Google User',
-          picture: `https://api.dicebear.com/7.x/bottts/svg?seed=${defaultEmail}`,
-          id: 'google_' + Date.now(),
-        },
-      });
-
-      if (res.data.success && res.data.token) {
-        localStorage.setItem('appdb_jwt_token', res.data.token);
-        sessionStorage.removeItem('appdb_logout_toast');
-        message.success(`Berhasil masuk dengan akun Google: ${defaultEmail}`);
-        onAuthSuccess(res.data.user, res.data.token);
-      }
-    } catch (err) {
-      message.error(err.response?.data?.error || 'Gagal masuk dengan akun Google.');
-    } finally {
-      setLoading(false);
-    }
+  const handleFillDefaultLocal = () => {
+    setLoginEmail('admin@local');
+    setLoginPassword('admin123');
+    message.info('Akun lokal default terisi. Silakan klik "Masuk".');
   };
 
   return (
@@ -368,50 +216,43 @@ export default function AuthPortal({ onAuthSuccess }) {
               <path d="M4 12c0 1.1 3.6 2 8 2s8-.9 8-2" stroke="#fff" strokeWidth="1.6" />
             </svg>
           </span>
-          <span><b>App Database</b> · Platform Database Client Modern</span>
+          <span><b>App Database</b> · Mode Akun Lokal</span>
         </div>
 
         {/* =================================================================== */}
-        {/* VIEW 1: LOGIN PAGE (DEFAULT)                                        */}
+        {/* VIEW 1: LOGIN PAGE (LOCAL ACCOUNT)                                  */}
         {/* =================================================================== */}
         {authMode === 'login' && (
           <div>
-            <h1>Masuk ke Akun Anda</h1>
-            <p className="sub">Gunakan akun terdaftar Anda untuk melanjutkan.</p>
-
-            {/* Google Login Button */}
-            <button className="btn-google" type="button" onClick={handleGoogleAuth} disabled={loading}>
-              <svg width="18" height="18" viewBox="0 0 48 48">
-                <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.9 32.5 29.4 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.6 6.1 29.6 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.3-.4-3.5z" />
-                <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 16 19 13 24 13c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.6 6.1 29.6 4 24 4c-7.4 0-13.7 4.2-16.9 10.3z" />
-                <path fill="#4CAF50" d="M24 44c5.4 0 10.3-2 14-5.3l-6.5-5.4C29.4 34.9 26.9 36 24 36c-5.3 0-9.8-3.4-11.4-8.1l-6.6 5.1C9.5 39.6 16.2 44 24 44z" />
-                <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1 2.8-2.9 5.1-5.3 6.6l6.5 5.4C39.9 37.3 44 31.3 44 24c0-1.3-.1-2.3-.4-3.5z" />
-              </svg>
-              Masuk dengan Akun Google
-            </button>
-
-            <div className="divider">atau dengan email</div>
+            <h1>Masuk Akun Lokal</h1>
+            <p className="sub">
+              Login biasa tanpa akun Google. Database target Anda tetap bisa terhubung secara online.
+            </p>
 
             <form onSubmit={handleLoginSubmit}>
-              <label htmlFor="email">Alamat Email</label>
+              <label htmlFor="email">Username atau Email</label>
               <div className="field">
                 <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
-                  <path d="M4 6h16v12H4z" />
-                  <path d="m4 7 8 6 8-6" />
+                  <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                  <circle cx="12" cy="7" r="4" />
                 </svg>
                 <input
                   id="email"
-                  type="email"
-                  placeholder="nama@email.com"
+                  type="text"
+                  placeholder="admin atau admin@local"
                   value={loginEmail}
                   onChange={(e) => setLoginEmail(e.target.value)}
+                  autoFocus
                   required
                 />
               </div>
 
               <div className="label-row">
                 <label htmlFor="pass">Kata Sandi</label>
-                <a onClick={() => setAuthMode('forgot')}>Lupa Kata Sandi?</a>
+                <a onClick={() => {
+                  setResetEmail(loginEmail);
+                  setAuthMode('forgot');
+                }}>Reset Kata Sandi?</a>
               </div>
               <div className="field">
                 <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
@@ -463,31 +304,59 @@ export default function AuthPortal({ onAuthSuccess }) {
               </button>
             </form>
 
+            {/* Quick Local Default Account Info */}
+            <div style={{
+              marginTop: 16,
+              padding: '10px 14px',
+              borderRadius: 10,
+              background: 'rgba(108, 92, 231, 0.06)',
+              border: '1px solid rgba(108, 92, 231, 0.16)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 10,
+              fontSize: 12,
+            }}>
+              <div style={{ color: '#4c4663', lineHeight: 1.4 }}>
+                <div style={{ fontWeight: 600, color: '#3b3366' }}>Akun Lokal Default</div>
+                <div>
+                  User: <code>admin</code> · Sandi: <code>admin123</code>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={handleFillDefaultLocal}
+                style={{
+                  background: '#fff',
+                  border: '1px solid #d5cef7',
+                  color: '#5b47d6',
+                  borderRadius: 7,
+                  padding: '5px 10px',
+                  fontSize: 11.5,
+                  fontWeight: 600,
+                  cursor: 'pointer',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                Isi Otomatis
+              </button>
+            </div>
+
             <p className="footer">
-              Belum memiliki akun? <a onClick={() => setAuthMode('register')}>Daftar di sini</a>
+              Belum punya akun lokal? <a onClick={() => setAuthMode('register')}>Buat Akun Lokal</a>
             </p>
           </div>
         )}
 
         {/* =================================================================== */}
-        {/* VIEW 2: REGISTER PAGE                                              */}
+        {/* VIEW 2: REGISTER PAGE (LOCAL ACCOUNT)                               */}
         {/* =================================================================== */}
         {authMode === 'register' && (
           <div>
-            <h1>Daftar Akun Baru</h1>
-            <p className="sub">Buat akun untuk menyimpan konfigurasi dan slot database Anda.</p>
-
-            <button className="btn-google" type="button" onClick={handleGoogleAuth} disabled={loading}>
-              <svg width="18" height="18" viewBox="0 0 48 48">
-                <path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3C33.9 32.5 29.4 36 24 36c-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.6 6.1 29.6 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.3-.4-3.5z" />
-                <path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 16 19 13 24 13c3.1 0 5.9 1.2 8 3.1l5.7-5.7C34.6 6.1 29.6 4 24 4c-7.4 0-13.7 4.2-16.9 10.3z" />
-                <path fill="#4CAF50" d="M24 44c5.4 0 10.3-2 14-5.3l-6.5-5.4C29.4 34.9 26.9 36 24 36c-5.3 0-9.8-3.4-11.4-8.1l-6.6 5.1C9.5 39.6 16.2 44 24 44z" />
-                <path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-1 2.8-2.9 5.1-5.3 6.6l6.5 5.4C39.9 37.3 44 31.3 44 24c0-1.3-.1-2.3-.4-3.5z" />
-              </svg>
-              Daftar dengan Akun Google
-            </button>
-
-            <div className="divider">atau dengan formulir</div>
+            <h1>Buat Akun Lokal</h1>
+            <p className="sub">
+              Akun tersimpan di komputer lokal &amp; langsung aktif tanpa verifikasi email/Google.
+            </p>
 
             <form onSubmit={handleRegisterSubmit}>
               <label htmlFor="reg-name">Nama Lengkap</label>
@@ -502,11 +371,12 @@ export default function AuthPortal({ onAuthSuccess }) {
                   placeholder="Contoh: Fajar Wahyudi"
                   value={registerName}
                   onChange={(e) => setRegisterName(e.target.value)}
+                  autoFocus
                   required
                 />
               </div>
 
-              <label htmlFor="reg-email">Alamat Email</label>
+              <label htmlFor="reg-email">Username atau Email</label>
               <div className="field">
                 <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
                   <path d="M4 6h16v12H4z" />
@@ -514,15 +384,15 @@ export default function AuthPortal({ onAuthSuccess }) {
                 </svg>
                 <input
                   id="reg-email"
-                  type="email"
-                  placeholder="nama@email.com"
+                  type="text"
+                  placeholder="contoh: fajar atau fajar@local"
                   value={registerEmail}
                   onChange={(e) => setRegisterEmail(e.target.value)}
                   required
                 />
               </div>
 
-              <label htmlFor="reg-pass">Kata Sandi (Min. 8 Karakter)</label>
+              <label htmlFor="reg-pass">Kata Sandi (Min. 6 Karakter)</label>
               <div className="field" style={{ marginBottom: passwordStrength > 0 ? 8 : 18 }}>
                 <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
                   <rect x="5" y="10" width="14" height="10" rx="2" />
@@ -596,13 +466,13 @@ export default function AuthPortal({ onAuthSuccess }) {
 
               <button className="submit" type="submit" disabled={loading}>
                 {loading ? (
-                  <span>Mendaftarkan...</span>
+                  <span>Membuat Akun...</span>
                 ) : (
                   <>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                       <path d="M5 12h14M13 5l7 7-7 7" />
                     </svg>
-                    Daftar Sekarang
+                    Buat Akun &amp; Langsung Masuk
                   </>
                 )}
               </button>
@@ -615,103 +485,34 @@ export default function AuthPortal({ onAuthSuccess }) {
         )}
 
         {/* =================================================================== */}
-        {/* VIEW 3: FORGOT PASSWORD REQUEST                                     */}
+        {/* VIEW 3: LOCAL PASSWORD RESET (DIRECT WITHOUT EMAIL OTP)             */}
         {/* =================================================================== */}
         {authMode === 'forgot' && (
           <div>
-            <h1>Lupa Kata Sandi?</h1>
+            <h1>Reset Kata Sandi Lokal</h1>
             <p className="sub">
-              Masukkan alamat email Anda untuk menerima kode OTP verifikasi reset 6 digit.
+              Atur ulang kata sandi akun lokal Anda secara langsung tanpa kode email.
             </p>
 
-            <form onSubmit={handleForgotPasswordSubmit}>
-              <label htmlFor="forgot-email">Alamat Email Terdaftar</label>
+            <form onSubmit={handleResetPasswordLocalSubmit}>
+              <label htmlFor="reset-email">Username atau Email Terdaftar</label>
               <div className="field">
                 <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
-                  <path d="M4 6h16v12H4z" />
-                  <path d="m4 7 8 6 8-6" />
+                  <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+                  <circle cx="12" cy="7" r="4" />
                 </svg>
                 <input
-                  id="forgot-email"
-                  type="email"
-                  placeholder="nama@email.com"
-                  value={forgotEmail}
-                  onChange={(e) => setForgotEmail(e.target.value)}
+                  id="reset-email"
+                  type="text"
+                  placeholder="admin atau username Anda"
+                  value={resetEmail}
+                  onChange={(e) => setResetEmail(e.target.value)}
                   required
                   autoFocus
                 />
               </div>
 
-              <button className="submit" type="submit" disabled={loading}>
-                {loading ? (
-                  <span>Mengirimkan...</span>
-                ) : (
-                  <>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M5 12h14M13 5l7 7-7 7" />
-                    </svg>
-                    Kirim Kode Reset OTP
-                  </>
-                )}
-              </button>
-            </form>
-
-            <p className="footer">
-              Ingat kata sandi Anda? <a onClick={() => setAuthMode('login')}>Kembali ke Masuk</a>
-            </p>
-          </div>
-        )}
-
-        {/* =================================================================== */}
-        {/* VIEW 4: RESET PASSWORD (VERIFY OTP + SET NEW PASSWORD)              */}
-        {/* =================================================================== */}
-        {authMode === 'reset' && (
-          <div>
-            <h1>Atur Ulang Kata Sandi</h1>
-            <p className="sub">
-              Masukkan kode OTP 6 digit yang dikirimkan ke <b>{targetEmail}</b>.
-            </p>
-
-            {devOtp && (
-              <div style={{
-                background: '#f4f2fb',
-                border: '1px solid #e9e7f2',
-                borderRadius: 10,
-                padding: '10px 14px',
-                fontSize: 12,
-                color: '#5b21b6',
-                marginBottom: 16,
-              }}>
-                Mode Dev: Kode reset Anda adalah{' '}
-                <strong
-                  style={{ cursor: 'pointer', textDecoration: 'underline' }}
-                  onClick={() => setResetCode(devOtp)}
-                  title="Klik untuk tempel"
-                >
-                  {devOtp} (Klik untuk tempel)
-                </strong>
-              </div>
-            )}
-
-            <form onSubmit={handleResetPasswordSubmit}>
-              <label htmlFor="reset-code">Kode Verifikasi (6 Digit)</label>
-              <div className="field">
-                <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
-                  <path d="m21 2-2 2m-1.5 1.5L14 9M3 21l3-3m0 0 8.5-8.5a2.12 2.12 0 1 0-3-3L0 15v6h6l8.5-8.5" />
-                </svg>
-                <input
-                  id="reset-code"
-                  type="text"
-                  maxLength={6}
-                  placeholder="123456"
-                  value={resetCode}
-                  onChange={(e) => setResetCode(e.target.value.replace(/\D/g, ''))}
-                  style={{ letterSpacing: 4, fontFamily: 'monospace', fontWeight: 600 }}
-                  required
-                />
-              </div>
-
-              <label htmlFor="new-pass">Kata Sandi Baru</label>
+              <label htmlFor="new-pass">Kata Sandi Baru (Min. 6 Karakter)</label>
               <div className="field">
                 <svg className="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
                   <rect x="5" y="10" width="14" height="10" rx="2" />
@@ -777,123 +578,9 @@ export default function AuthPortal({ onAuthSuccess }) {
               </button>
             </form>
 
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 18 }}>
-              <button
-                type="button"
-                onClick={handleResendOtp}
-                disabled={!canResend}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: canResend ? 'var(--purple)' : 'var(--muted)',
-                  fontSize: 12.5,
-                  cursor: canResend ? 'pointer' : 'default',
-                  padding: 0,
-                  fontWeight: 500,
-                }}
-              >
-                {canResend ? 'Kirim Ulang Kode' : `Kirim ulang (${countdown}s)`}
-              </button>
-              <a onClick={() => setAuthMode('login')} style={{ color: 'var(--muted)', fontSize: 12.5 }}>
-                Batal / Masuk
-              </a>
-            </div>
-          </div>
-        )}
-
-        {/* =================================================================== */}
-        {/* VIEW 5: VERIFY REGISTRATION OTP                                     */}
-        {/* =================================================================== */}
-        {authMode === 'verify' && (
-          <div>
-            <h1>Verifikasi Akun Anda</h1>
-            <p className="sub">
-              Masukkan 6 digit kode OTP yang dikirimkan ke <b>{targetEmail}</b>.
+            <p className="footer">
+              Ingat kata sandi Anda? <a onClick={() => setAuthMode('login')}>Kembali ke Masuk</a>
             </p>
-
-            {devOtp && (
-              <div style={{
-                background: '#f4f2fb',
-                border: '1px solid #e9e7f2',
-                borderRadius: 10,
-                padding: '10px 14px',
-                fontSize: 12,
-                color: '#5b21b6',
-                marginBottom: 16,
-              }}>
-                Mode Dev: Kode verifikasi Anda adalah{' '}
-                <strong
-                  style={{ cursor: 'pointer', textDecoration: 'underline' }}
-                  onClick={() => setOtpCode(devOtp)}
-                  title="Klik untuk tempel"
-                >
-                  {devOtp} (Klik untuk tempel)
-                </strong>
-              </div>
-            )}
-
-            <form onSubmit={handleVerifyOtpSubmit}>
-              <div className="field" style={{ marginBottom: 12 }}>
-                <input
-                  type="text"
-                  maxLength={6}
-                  value={otpCode}
-                  onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, ''))}
-                  placeholder="• • • • • •"
-                  style={{
-                    fontSize: 24,
-                    letterSpacing: 10,
-                    textAlign: 'center',
-                    fontWeight: 700,
-                    padding: '14px',
-                    color: 'var(--purple)',
-                    fontFamily: 'monospace',
-                  }}
-                  autoFocus
-                  required
-                />
-              </div>
-
-              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 18, fontSize: 12, color: 'var(--muted)' }}>
-                <span>Sisa kesempatan: <b>{remainingAttempts} kali</b></span>
-                <span>Masa berlaku: <b>10 menit</b></span>
-              </div>
-
-              <button className="submit" type="submit" disabled={loading}>
-                {loading ? (
-                  <span>Memverifikasi...</span>
-                ) : (
-                  <>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                      <path d="M5 12h14M13 5l7 7-7 7" />
-                    </svg>
-                    Verifikasi &amp; Aktifkan Akun
-                  </>
-                )}
-              </button>
-            </form>
-
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 18 }}>
-              <button
-                type="button"
-                onClick={handleResendOtp}
-                disabled={!canResend}
-                style={{
-                  background: 'none',
-                  border: 'none',
-                  color: canResend ? 'var(--purple)' : 'var(--muted)',
-                  fontSize: 12.5,
-                  cursor: canResend ? 'pointer' : 'default',
-                  padding: 0,
-                  fontWeight: 500,
-                }}
-              >
-                {canResend ? 'Kirim Ulang Kode' : `Kirim ulang (${countdown}s)`}
-              </button>
-              <a onClick={() => setAuthMode('login')} style={{ color: 'var(--muted)', fontSize: 12.5 }}>
-                Kembali ke Masuk
-              </a>
-            </div>
           </div>
         )}
       </div>

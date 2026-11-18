@@ -3,7 +3,7 @@ import axios from 'axios';
 import {
   Input, Button, Table, Tabs, Modal, message, Form, Typography, Space, Spin, Tooltip,
   Popconfirm, Select, Checkbox, Switch, Tag, Badge, Card, Divider, Row, Col, Segmented, Popover,
-  Alert, notification,
+  Alert, notification, Dropdown,
 } from 'antd';
 import {
   DatabaseOutlined, TableOutlined, PlayCircleOutlined,
@@ -14,7 +14,7 @@ import {
   ClearOutlined, SettingOutlined, AppstoreAddOutlined,
   PlusCircleOutlined, CheckCircleOutlined, LinkOutlined,
   HistoryOutlined, ArrowUpOutlined, ArrowDownOutlined,
-  DashboardOutlined, SwapOutlined,
+  DashboardOutlined, SwapOutlined, MoreOutlined, EyeInvisibleOutlined,
 } from '@ant-design/icons';
 
 import AuthPortal from './components/AuthPortal';
@@ -35,6 +35,51 @@ const COLUMN_TYPES = [
   'INTEGER', 'TEXT', 'VARCHAR(255)', 'REAL', 'NUMERIC',
   'BOOLEAN', 'DATETIME', 'DATE', 'BLOB'
 ];
+
+// Hitung lebar kolom otomatis & proporsional mengikuti isi data (min 68px, maks 280px)
+function computeColumnWidth(colKey, rows = []) {
+  const headerLen = String(colKey || '').length;
+  const sampleSize = Math.min(rows.length, 100);
+  let maxContentLen = 0;
+
+  for (let i = 0; i < sampleSize; i++) {
+    const val = rows[i]?.[colKey];
+    let len = 4; // 'NULL'
+    if (val !== null && val !== undefined) {
+      if (typeof val === 'object') {
+        len = Math.min(JSON.stringify(val).length, 36);
+      } else {
+        len = String(val).length;
+      }
+    }
+    if (len > maxContentLen) maxContentLen = len;
+  }
+
+  // Header uppercase 11px (~7.8px/char) + padding + tombol menu ⋮ (~42px)
+  const headerPx = Math.ceil(headerLen * 7.8 + 44);
+  // Isi sel monospace 12px (~7.4px/char) + padding horizontal (~26px)
+  const contentPx = Math.ceil(Math.min(maxContentLen, 36) * 7.4 + 26);
+
+  return Math.max(68, Math.min(280, Math.max(headerPx, contentPx)));
+}
+
+// Renderer isi sel: teks panjang otomatis turun ke bawah (word-wrap) agar mudah dibaca
+function renderCellValue(value) {
+  if (value === null || value === undefined) {
+    return <span className="cell-null">NULL</span>;
+  }
+  if (typeof value === 'boolean') {
+    return (
+      <span className={value ? 'cell-bool-true' : 'cell-bool-false'}>
+        {String(value)}
+      </span>
+    );
+  }
+  if (typeof value === 'object') {
+    return <div className="cell-wrap-text cell-json">{JSON.stringify(value)}</div>;
+  }
+  return <div className="cell-wrap-text">{String(value)}</div>;
+}
 
 export default function App() {
   const [connectionForm] = Form.useForm();
@@ -265,6 +310,7 @@ export default function App() {
   const [renameLoading, setRenameLoading] = useState(false);
   const [inlineEditingCol, setInlineEditingCol] = useState(null);
   const [inlineColNewName, setInlineColNewName] = useState('');
+  const [seedingExampleLoading, setSeedingExampleLoading] = useState(false);
 
   // New table builder state
   const [newTableName, setNewTableName] = useState('');
@@ -393,7 +439,9 @@ export default function App() {
     try {
       const payload = {
         ...values,
-        connection_string: values.connection_string || connString || undefined,
+        connection_string: values.type === 'sqlite'
+          ? undefined
+          : (values.connection_string || undefined),
       };
       const res = await axios.post(`${API_URL}/connect`, payload);
       if (res.data.success) {
@@ -452,19 +500,19 @@ export default function App() {
           return updated;
         });
 
-        // Save to user's isolated database storage with AES-256 encryption
-        if (currentUser && saveToAccount) {
+        // Save to user's isolated database storage with AES-256 encryption (only for brand-new manual connections)
+        if (currentUser && saveToAccount && !values.id && !values.skipSaveSlot) {
           try {
             const label = connectionLabel.trim() || `${values.database}@${values.host}`;
             axios.post('/api/user/connections', {
               name: label,
-              type: values.host === 'localhost' && values.database === 'demo' ? 'sqlite' : 'postgres',
+              type: values.type || (values.host === 'localhost' && values.database === 'demo' ? 'sqlite' : 'postgres'),
               host: values.host,
               port: values.port,
               database_name: values.database,
               username: values.user,
               password: values.password,
-              connection_string: connString || null,
+              connection_string: values.connection_string || null,
             }).then(() => fetchUserConnections()).catch(() => {});
           } catch (e) { /* ignore */ }
         }
@@ -479,6 +527,19 @@ export default function App() {
       setConnectingStatus('');
       setIsRestoringSession(false);
     }
+  };
+
+  // ---------- OPEN BUILT-IN EXAMPLE DATABASE (1-CLICK PREVIEW) ----------
+  const handleOpenExampleDatabase = async () => {
+    await handleConnect({
+      type: 'sqlite',
+      host: 'localhost',
+      port: 3001,
+      database: 'demo',
+      user: 'demo',
+      password: '',
+      skipSaveSlot: true,
+    });
   };
 
   // ---------- AUTO-RECONNECT ON MOUNT ----------
@@ -629,14 +690,8 @@ export default function App() {
             title: f.name,
             dataIndex: f.name,
             key: f.name,
-            ellipsis: true,
-            width: 160,
-            render: (value) => {
-              if (value === null) return <span style={{ color: '#5c6070', fontStyle: 'italic' }}>NULL</span>;
-              if (typeof value === 'boolean') return <span style={{ color: value ? '#00b894' : '#e17055' }}>{String(value)}</span>;
-              if (typeof value === 'object') return <span style={{ color: '#fdcb6e' }}>{JSON.stringify(value)}</span>;
-              return String(value);
-            },
+            width: computeColumnWidth(f.name, rows),
+            render: renderCellValue,
           }))
         : [];
       setQueryResult({ columns, data: rows, rowCount: rowCount || rows.length });
@@ -1041,6 +1096,59 @@ export default function App() {
     }
   };
 
+  // ---------- SEED EXAMPLE DATABASE (PostgreSQL, MySQL, SQLite) ----------
+  const handleSeedExampleDatabase = () => {
+    if (!credentials) return;
+    Modal.confirm({
+      title: '⚡ Buat Example Database?',
+      content: (
+        <div>
+          <p>
+            Aksi ini akan membuat tabel-tabel contoh (seperti <b>departments, employees, customers, product_categories, products, orders, order_items, activity_logs</b>) beserta data dummy lengkap ke database <b>{credentials.database}</b>.
+          </p>
+          <p style={{ color: '#d97706', fontSize: 12, marginBottom: 0 }}>
+            ⚠️ Sangat cocok untuk menguji fitur, kueri analitik, dan melihat performa database.
+          </p>
+        </div>
+      ),
+      okText: 'Ya, Buat Example Database',
+      cancelText: 'Batal',
+      okButtonProps: { style: { background: '#4f46e5', borderColor: '#4f46e5' } },
+      onOk: async () => {
+        setSeedingExampleLoading(true);
+        try {
+          const res = await axios.post(`${API_URL}/database/seed-example`, credentials);
+          if (res.data.success) {
+            notification.success({
+              message: `Example Database (${res.data.engine}) Berhasil Dibuat!`,
+              description: res.data.message || `${res.data.tables?.length || 0} tabel contoh telah di-generate.`,
+              placement: 'topRight',
+              duration: 6,
+            });
+            if (res.data.tables && res.data.tables.length > 0) {
+              setTables(res.data.tables);
+              const firstTable = res.data.tables[0];
+              if (!openTabs.includes(firstTable)) {
+                setOpenTabs(prev => [...prev, firstTable]);
+              }
+              setActiveTab(firstTable);
+              fetchTableData(firstTable);
+              fetchTableStructure(firstTable);
+            }
+          }
+        } catch (err) {
+          notification.error({
+            message: 'Gagal Membuat Example Database',
+            description: err.response?.data?.error || err.message,
+            placement: 'topRight',
+          });
+        } finally {
+          setSeedingExampleLoading(false);
+        }
+      },
+    });
+  };
+
   // ---------- CREATE TABLE BUILDER ----------
   const handleAddColumnToNewTable = () => {
     setNewTableColumns(prev => [
@@ -1254,6 +1362,7 @@ export default function App() {
         slots={savedDbConnections}
         onRefreshSlots={fetchUserConnections}
         onSelectSlot={handleSelectSavedConnection}
+        onOpenExampleDatabase={handleOpenExampleDatabase}
         onLogout={handleLogout}
       />
     );
@@ -1317,7 +1426,7 @@ export default function App() {
 
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <Input
-                    placeholder="🔍 Filter hasil query..."
+                    placeholder="Filter hasil query..."
                     allowClear
                     value={queryResultSearch}
                     onChange={(e) => setQueryResultSearch(e.target.value)}
@@ -1329,13 +1438,14 @@ export default function App() {
                     value={queryScrollFull ? 'scroll' : 'paged'}
                     onChange={(val) => setQueryScrollFull(val === 'scroll')}
                     options={[
-                      { label: '📜 Scroll Penuh', value: 'scroll' },
-                      { label: '📄 Paginasi', value: 'paged' },
+                      { label: 'Scroll Penuh', value: 'scroll' },
+                      { label: 'Paginasi', value: 'paged' },
                     ]}
                   />
                 </div>
               </div>
               <Table
+                className="smart-data-table"
                 columns={queryResult.columns}
                 dataSource={filteredQueryData}
                 rowKey={(_, index) => index}
@@ -1380,139 +1490,86 @@ export default function App() {
         })
       : [];
 
-    // Construct columns for data table with Move Left / Right buttons & Direct Edit Column actions
+    const rawTableRows = data ? data.data : [];
+
+    // Construct columns for data table: auto-sized width + multi-line wrapping + clean ⋮ dropdown menu
     const tableDisplayColumns = [
-      ...visibleColumnKeys.map((colKey, colIdx) => {
-        const isEditingThis = inlineEditingCol === `${tableName}.${colKey}`;
-        return {
-          title: (
-            <div className="col-header-container">
-              <span
-                style={{ cursor: 'pointer', fontWeight: 600 }}
-                title="Klik dua kali atau gunakan ikon edit untuk mengubah nama kolom"
-                onDoubleClick={() => {
-                  setInlineEditingCol(`${tableName}.${colKey}`);
-                  setInlineColNewName(colKey);
-                }}
+      ...visibleColumnKeys.map((colKey, colIdx) => ({
+        title: (
+          <div className="col-header-container">
+            <span
+              className="col-header-title"
+              title={`${colKey} — Klik dua kali untuk mengubah nama kolom`}
+              onDoubleClick={() => openRenameColumnModal(tableName, colKey)}
+            >
+              {colKey}
+            </span>
+            <Dropdown
+              trigger={['click']}
+              placement="bottomRight"
+              menu={{
+                items: [
+                  {
+                    key: 'rename',
+                    icon: <EditOutlined style={{ color: '#7c3aed' }} />,
+                    label: 'Ubah Nama Kolom',
+                    onClick: () => openRenameColumnModal(tableName, colKey),
+                  },
+                  { type: 'divider' },
+                  {
+                    key: 'left',
+                    icon: <ArrowLeftOutlined />,
+                    label: 'Geser ke Kiri',
+                    disabled: colIdx === 0,
+                    onClick: () => moveColumn(tableName, colKey, 'left'),
+                  },
+                  {
+                    key: 'right',
+                    icon: <ArrowRightOutlined />,
+                    label: 'Geser ke Kanan',
+                    disabled: colIdx === visibleColumnKeys.length - 1,
+                    onClick: () => moveColumn(tableName, colKey, 'right'),
+                  },
+                  { type: 'divider' },
+                  {
+                    key: 'hide',
+                    icon: <EyeInvisibleOutlined style={{ color: '#64748b' }} />,
+                    label: 'Sembunyikan Kolom',
+                    onClick: () => toggleColumnVisibility(tableName, colKey),
+                  },
+                ],
+              }}
+            >
+              <button
+                type="button"
+                className="col-menu-trigger"
+                title="Opsi kolom (Ubah nama, geser, sembunyikan)"
+                onClick={(e) => e.stopPropagation()}
               >
-                {colKey}
-              </span>
-              <span style={{ display: 'inline-flex', gap: 2, marginLeft: 'auto', alignItems: 'center' }}>
-                <Popover
-                  content={
-                    <div style={{ width: 240, padding: 4 }}>
-                      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4, color: '#0f172a' }}>
-                        ✏️ Ubah Nama Kolom
-                      </div>
-                      <div style={{ fontSize: 11, color: '#b45309', marginBottom: 8, background: '#fffbeb', padding: '4px 8px', borderRadius: 4, border: '1px solid #fde68a' }}>
-                        ⚠️ Perubahan nama kolom langsung berdampak pada query aplikasi terhubung!
-                      </div>
-                      <div style={{ fontSize: 11, color: '#64748b', marginBottom: 8 }}>
-                        Kolom: <Tag color="purple">{colKey}</Tag>
-                      </div>
-                      <Input
-                        size="small"
-                        value={inlineColNewName}
-                        onChange={(e) => setInlineColNewName(e.target.value)}
-                        onPressEnter={() => handleRenameColumnSubmit(tableName, colKey, inlineColNewName)}
-                        placeholder="Nama kolom baru..."
-                        autoFocus
-                        style={{ marginBottom: 10 }}
-                      />
-                      <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
-                        <Button
-                          size="small"
-                          onClick={() => setInlineEditingCol(null)}
-                        >
-                          Batal
-                        </Button>
-                        <Button
-                          size="small"
-                          type="primary"
-                          loading={renameLoading}
-                          onClick={() => handleRenameColumnSubmit(tableName, colKey, inlineColNewName)}
-                          style={{ background: '#7c3aed', borderColor: '#7c3aed' }}
-                        >
-                          Simpan
-                        </Button>
-                      </div>
-                    </div>
-                  }
-                  title={null}
-                  trigger="click"
-                  open={isEditingThis}
-                  onOpenChange={(open) => {
-                    if (open) {
-                      setInlineEditingCol(`${tableName}.${colKey}`);
-                      setInlineColNewName(colKey);
-                    } else {
-                      setInlineEditingCol(null);
-                    }
-                  }}
-                  placement="bottomRight"
-                >
-                  <Tooltip title="Klik Edit Langsung (Ubah nama kolom)">
-                    <Button
-                      className="col-move-btn col-edit-btn"
-                      icon={<EditOutlined style={{ color: '#7c3aed' }} />}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setInlineEditingCol(`${tableName}.${colKey}`);
-                        setInlineColNewName(colKey);
-                      }}
-                    />
-                  </Tooltip>
-                </Popover>
-                <Tooltip title="Pindahkan kolom ke kiri">
-                  <Button
-                    className="col-move-btn"
-                    icon={<ArrowLeftOutlined />}
-                    disabled={colIdx === 0}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      moveColumn(tableName, colKey, 'left');
-                    }}
-                  />
-                </Tooltip>
-                <Tooltip title="Pindahkan kolom ke kanan">
-                  <Button
-                    className="col-move-btn"
-                    icon={<ArrowRightOutlined />}
-                    disabled={colIdx === visibleColumnKeys.length - 1}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      moveColumn(tableName, colKey, 'right');
-                    }}
-                  />
-                </Tooltip>
-              </span>
-            </div>
-          ),
-          dataIndex: colKey,
-          key: colKey,
-          ellipsis: true,
-          width: 180,
-        render: (value) => {
-          if (value === null) return <span style={{ color: '#5c6070', fontStyle: 'italic' }}>NULL</span>;
-          if (typeof value === 'boolean') return <span style={{ color: value ? '#00b894' : '#e17055' }}>{String(value)}</span>;
-          if (typeof value === 'object') return <span style={{ color: '#fdcb6e' }}>{JSON.stringify(value)}</span>;
-          return String(value);
-        },
-      };
-    }),
+                <MoreOutlined />
+              </button>
+            </Dropdown>
+          </div>
+        ),
+        dataIndex: colKey,
+        key: colKey,
+        width: computeColumnWidth(colKey, rawTableRows),
+        render: renderCellValue,
+      })),
       {
-        title: 'Actions',
+        title: 'Aksi',
         key: '__actions__',
         fixed: 'right',
-        width: 100,
+        align: 'center',
+        width: 82,
         render: (_, record) => (
-          <Space size="small">
+          <Space size={2}>
             <Tooltip title="Edit baris">
               <Button
                 type="text"
                 size="small"
                 className="row-action-btn"
-                icon={<EditOutlined style={{ color: '#a29bfe' }} />}
+                icon={<EditOutlined style={{ color: '#6C5CE7' }} />}
                 onClick={() => openEditRowModal(record)}
               />
             </Tooltip>
@@ -1603,14 +1660,17 @@ export default function App() {
           </div>
         </div>
 
-        {/* Global Warning Alert Banner */}
+        {/* Compact Global Warning Alert Banner */}
         <Alert
-          message="Peringatan Perubahan Data"
-          description="Perubahan data (tambah baris, edit data, hapus, truncate) yang dilakukan pada tabel ini akan langsung tersimpan ke database utama dan berdampak pada seluruh aplikasi yang telah terhubung."
+          message={
+            <span style={{ fontSize: 12.5 }}>
+              <b>Peringatan:</b> Setiap perubahan data (tambah, edit, hapus, truncate) langsung tersimpan di database utama dan berdampak pada aplikasi yang telah terhubung.
+            </span>
+          }
           type="warning"
           showIcon
           closable
-          style={{ marginBottom: 14, borderRadius: 8 }}
+          style={{ marginBottom: 12, borderRadius: 8, padding: '7px 12px' }}
         />
 
         {/* Action Toolbar Strip */}
@@ -1624,9 +1684,9 @@ export default function App() {
                 addRowForm.resetFields();
                 setAddRowModalVisible(true);
               }}
-              style={{ background: '#6C5CE7', borderColor: '#6C5CE7' }}
+              style={{ background: '#4f46e5', borderColor: '#4f46e5', fontWeight: 500 }}
             >
-              Insert Row
+              Tambah Baris
             </Button>
             <Button
               size="small"
@@ -1636,20 +1696,20 @@ export default function App() {
                 setAddColumnModalVisible(true);
               }}
             >
-              Add Column
+              Tambah Kolom
             </Button>
             <Button
               size="small"
               icon={<SettingOutlined />}
               onClick={() => setColumnManageModalVisible(true)}
             >
-              Columns & Order ({visibleColumnKeys.length}/{currentOrder.length})
+              Atur Kolom ({visibleColumnKeys.length}/{currentOrder.length})
             </Button>
           </div>
 
           <div className="toolbar-group">
-            <span style={{ fontSize: 11, color: '#8b8fa3' }}>
-              💡 Gunakan tombol <b>✏️ Edit</b> di judul kolom untuk ubah nama langsung, atau <b>⬅ ➡</b> untuk memindahkan urutan
+            <span style={{ fontSize: 11.5, color: '#64748b' }}>
+              Klik ikon <b>⋮</b> pada judul kolom untuk ubah nama, geser urutan, atau sembunyikan kolom
             </span>
           </div>
         </div>
@@ -1660,10 +1720,10 @@ export default function App() {
             className={`structure-toggle ${isStructureCollapsed ? 'collapsed' : ''}`}
             onClick={() => setStructureCollapsed(prev => ({ ...prev, [tableName]: !prev[tableName] }))}
           >
-            <DownOutlined />
-            <KeyOutlined />
-            <span>Structure</span>
-            {structure && <span style={{ fontWeight: 400, color: '#5c6070' }}>({structure.length} columns)</span>}
+            <DownOutlined className="structure-toggle-arrow" />
+            <KeyOutlined style={{ color: '#4f46e5' }} />
+            <span>Struktur Kolom</span>
+            {structure && <span className="structure-count">({structure.length} kolom)</span>}
           </div>
           {!isStructureCollapsed && structure && (
             <Table
@@ -1793,14 +1853,14 @@ export default function App() {
 
           return (
             <div className="data-section">
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginBottom: 12 }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <div className="section-label" style={{ marginBottom: 0 }}>
-                    <TableOutlined />
-                    <span>Data Records</span>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10, marginBottom: 10 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <div className="section-label">
+                    <TableOutlined style={{ color: '#4f46e5' }} />
+                    <span>Data Tabel</span>
                   </div>
                   {data && (
-                    <Tag color="geekblue" style={{ borderRadius: 12, fontWeight: 600, fontSize: 12 }}>
+                    <Tag color="geekblue" style={{ borderRadius: 12, fontWeight: 600, fontSize: 12, margin: 0 }}>
                       {filteredData.length} baris {searchKw ? `(ditemukan dari ${data.data.length})` : 'dimuat'}
                     </Tag>
                   )}
@@ -1809,11 +1869,11 @@ export default function App() {
                 {/* Keyword Search & Scroll Mode Toggle */}
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                   <Input
-                    placeholder="🔍 Cari kata kunci di seluruh kolom..."
+                    placeholder="Cari kata kunci di seluruh kolom..."
                     allowClear
                     value={tableDataSearch[tableName] || ''}
                     onChange={(e) => setTableDataSearch(prev => ({ ...prev, [tableName]: e.target.value }))}
-                    style={{ width: 280, borderRadius: 6 }}
+                    style={{ width: 260, borderRadius: 6 }}
                     prefix={<SearchOutlined style={{ color: '#8b8fa3' }} />}
                   />
                   <Tooltip title={isScrollFull ? 'Mode Scroll Penuh: Menampilkan semua data dalam satu guliran sampai baris terakhir' : 'Mode Paginasi: Membagi data ke dalam halaman'}>
@@ -1822,8 +1882,8 @@ export default function App() {
                       value={isScrollFull ? 'scroll' : 'paged'}
                       onChange={(val) => setTableScrollModes(prev => ({ ...prev, [tableName]: val === 'scroll' }))}
                       options={[
-                        { label: '📜 Scroll Penuh', value: 'scroll' },
-                        { label: '📄 Paginasi', value: 'paged' },
+                        { label: 'Scroll Penuh', value: 'scroll' },
+                        { label: 'Paginasi', value: 'paged' },
                       ]}
                     />
                   </Tooltip>
@@ -1832,14 +1892,15 @@ export default function App() {
 
               {data ? (
                 <Table
+                  className="smart-data-table"
                   columns={tableDisplayColumns}
                   dataSource={filteredData}
                   rowKey={(_, index) => index}
-                  scroll={{ x: 'max-content', y: isScrollFull ? 'calc(100vh - 310px)' : undefined }}
+                  scroll={{ x: 'max-content', y: isScrollFull ? 'calc(100vh - 330px)' : undefined }}
                   pagination={isScrollFull ? false : { pageSize: 50, size: 'small', showSizeChanger: true, pageSizeOptions: [20, 50, 100, 200, 500, 1000] }}
                   size="small"
                   bordered
-                  style={{ minHeight: isScrollFull ? 450 : undefined }}
+                  style={{ minHeight: isScrollFull ? 420 : undefined }}
                 />
               ) : (
                 <div className="loading-overlay"><Spin size="small" /> <span style={{ marginLeft: 8 }}>Loading data...</span></div>
@@ -1940,6 +2001,17 @@ export default function App() {
           >
             Pencarian Database
           </Button>
+          <Tooltip title="Buat tabel dan data contoh otomatis (PostgreSQL / MySQL / SQLite)">
+            <Button
+              size="small"
+              icon={<ThunderboltOutlined style={{ color: '#d97706' }} />}
+              loading={seedingExampleLoading}
+              onClick={handleSeedExampleDatabase}
+              style={{ borderRadius: 6, fontWeight: 500, borderColor: '#fde68a', color: '#b45309', background: '#fffbeb' }}
+            >
+              Example DB
+            </Button>
+          </Tooltip>
           <span className="header-shortcut-hint">Ctrl+P Tabel</span>
           <span className="header-shortcut-hint">Ctrl+Shift+F Cari</span>
           <UserHeader
@@ -1980,6 +2052,13 @@ export default function App() {
             >
               <SearchOutlined style={{ color: '#ec4899', fontSize: 14 }} />
               <span>Pencarian Database</span>
+            </div>
+            <div
+              className={`sidebar-nav-item`}
+              onClick={handleSeedExampleDatabase}
+            >
+              <ThunderboltOutlined style={{ color: '#d97706', fontSize: 14 }} />
+              <span>Example Database</span>
             </div>
             <div
               className={`sidebar-nav-item ${activeTab === 'query' ? 'active' : ''}`}

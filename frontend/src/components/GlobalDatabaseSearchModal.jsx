@@ -190,29 +190,37 @@ export default function GlobalDatabaseSearchModal({
                 {resultData.results.map((tableResult) => {
                   const sampleRow = tableResult.matchedRows[0] || {};
                   const colKeys = Object.keys(sampleRow);
-                  const previewCols = colKeys.map((k) => ({
-                    title: k,
-                    dataIndex: k,
-                    key: k,
-                    ellipsis: true,
-                    render: (val) => {
-                      if (val === null || val === undefined) {
-                        return <span style={{ color: '#94a3b8', fontStyle: 'italic' }}>NULL</span>;
-                      }
-                      const str = String(val);
-                      // Highlight matched keyword
-                      const lower = str.toLowerCase();
-                      const kw = (resultData.keyword || '').toLowerCase();
-                      if (kw && lower.includes(kw)) {
-                        return (
-                          <span style={{ background: '#fef08a', padding: '1px 4px', borderRadius: 3, fontWeight: 600 }}>
-                            {str}
-                          </span>
-                        );
-                      }
-                      return str;
-                    },
-                  }));
+                  const previewCols = colKeys.map((k) => {
+                    const maxLen = Math.max(
+                      k.length,
+                      ...tableResult.matchedRows.slice(0, 30).map((r) =>
+                        r[k] === null || r[k] === undefined ? 4 : Math.min(String(r[k]).length, 32)
+                      )
+                    );
+                    const autoWidth = Math.max(70, Math.min(240, Math.ceil(maxLen * 7.6 + 26)));
+                    return {
+                      title: k,
+                      dataIndex: k,
+                      key: k,
+                      width: autoWidth,
+                      render: (val) => {
+                        if (val === null || val === undefined) {
+                          return <span className="cell-null">NULL</span>;
+                        }
+                        const str = typeof val === 'object' ? JSON.stringify(val) : String(val);
+                        const lower = str.toLowerCase();
+                        const kw = (resultData.keyword || '').toLowerCase();
+                        if (kw && lower.includes(kw)) {
+                          return (
+                            <div className="cell-wrap-text" style={{ background: '#fef08a', padding: '1px 4px', borderRadius: 3, fontWeight: 600 }}>
+                              {str}
+                            </div>
+                          );
+                        }
+                        return <div className="cell-wrap-text">{str}</div>;
+                      },
+                    };
+                  });
 
                   return (
                     <Panel

@@ -28,6 +28,7 @@ export default function DatabaseSlotsHub({
   slots = [],
   onRefreshSlots,
   onSelectSlot,
+  onOpenExampleDatabase,
   onLogout,
 }) {
   const [modalVisible, setModalVisible] = useState(false);
@@ -39,8 +40,19 @@ export default function DatabaseSlotsHub({
   const [searchQuery, setSearchQuery] = useState('');
   const [saving, setSaving] = useState(false);
   const [connectingSlotId, setConnectingSlotId] = useState(null);
+  const [openingExample, setOpeningExample] = useState(false);
   const [testingConn, setTestingConn] = useState(false);
   const [testResult, setTestResult] = useState(null); // { success: boolean, message: string }
+
+  const handleOpenExample = async () => {
+    if (!onOpenExampleDatabase) return;
+    setOpeningExample(true);
+    try {
+      await onOpenExampleDatabase();
+    } finally {
+      setOpeningExample(false);
+    }
+  };
 
   const openCreateModal = (preset = null) => {
     setEditingSlot(null);
@@ -319,22 +331,44 @@ export default function DatabaseSlotsHub({
               Pilih slot database yang ingin Anda kelola, atau konfigurasikan slot baru untuk PostgreSQL, MySQL, MariaDB, SQLite, dan SQL Server.
             </Paragraph>
           </div>
-          <Button
-            type="primary"
-            size="large"
-            icon={<PlusOutlined />}
-            onClick={() => openCreateModal()}
-            style={{
-              height: 44,
-              borderRadius: 8,
-              fontWeight: 600,
-              background: '#4f46e5',
-              borderColor: '#4f46e5',
-              boxShadow: '0 4px 12px rgba(79, 70, 229, 0.25)',
-            }}
-          >
-            + Tambah Slot Database
-          </Button>
+          <Space size={10} wrap>
+            {onOpenExampleDatabase && (
+              <Tooltip title="Buka database contoh bawaan (8 tabel siap pakai) untuk melihat & mengecek tampilan database secara langsung">
+                <Button
+                  size="large"
+                  icon={<ThunderboltOutlined style={{ color: '#d97706' }} />}
+                  loading={openingExample}
+                  onClick={handleOpenExample}
+                  style={{
+                    height: 44,
+                    borderRadius: 8,
+                    fontWeight: 600,
+                    background: '#fffbeb',
+                    borderColor: '#f59e0b',
+                    color: '#b45309',
+                  }}
+                >
+                  {openingExample ? 'Membuka Example...' : 'Database Example'}
+                </Button>
+              </Tooltip>
+            )}
+            <Button
+              type="primary"
+              size="large"
+              icon={<PlusOutlined />}
+              onClick={() => openCreateModal()}
+              style={{
+                height: 44,
+                borderRadius: 8,
+                fontWeight: 600,
+                background: '#4f46e5',
+                borderColor: '#4f46e5',
+                boxShadow: '0 4px 12px rgba(79, 70, 229, 0.25)',
+              }}
+            >
+              + Tambah Slot Database
+            </Button>
+          </Space>
         </div>
 
         {/* Toolbar: Search, Filter Type, Refresh */}
@@ -494,6 +528,21 @@ export default function DatabaseSlotsHub({
                   >
                     Buat Slot Baru
                   </Button>
+                  {onOpenExampleDatabase && (
+                    <Button
+                      icon={<ThunderboltOutlined style={{ color: '#d97706' }} />}
+                      loading={openingExample}
+                      onClick={handleOpenExample}
+                      style={{
+                        background: '#fffbeb',
+                        borderColor: '#f59e0b',
+                        color: '#b45309',
+                        fontWeight: 600,
+                      }}
+                    >
+                      Buka Database Example (Langsung)
+                    </Button>
+                  )}
                   <Button
                     onClick={() => openCreateModal({
                       name: 'Demo SQLite (Lokal)',
@@ -504,7 +553,7 @@ export default function DatabaseSlotsHub({
                       username: 'demo',
                     })}
                   >
-                    ⚡ Preset SQLite Lokal
+                    ⚡ Simpan Preset SQLite Lokal
                   </Button>
                   <Button
                     onClick={() => openCreateModal({

@@ -5,6 +5,7 @@ const helmet = require('helmet');
 const { Pool } = require('pg');
 const mysql = require('mysql2/promise');
 const path = require('path');
+const fs = require('fs');
 
 let Database = null;
 try {
@@ -325,8 +326,12 @@ class SQLiteAdapter {
     return { rows, fields, total };
   }
 
-  close() {
-    this.db.close();
+  async close() {
+    try {
+      if (this.db && this.db.open) {
+        this.db.close();
+      }
+    } catch { /* ignore */ }
   }
 }
 
@@ -653,9 +658,12 @@ async function establishConnection(params) {
 app.post('/api/connect/test', requireAuth, async (req, res) => {
   try {
     const connData = await establishConnection(req.body);
-    // If pool was opened, clean it up immediately
+    // If pool/adapter was opened, clean it up immediately
     if (connData.pool) {
-      await connData.pool.end().catch(() => {});
+      await Promise.resolve(connData.pool.end()).catch(() => {});
+    }
+    if (connData.adapter && typeof connData.adapter.close === 'function') {
+      await Promise.resolve(connData.adapter.close()).catch(() => {});
     }
     return res.json({
       success: true,
@@ -687,8 +695,10 @@ app.post('/api/connect', requireAuth, async (req, res) => {
     // Close any previous connection under this key
     if (connections.has(key)) {
       const oldConn = connections.get(key);
-      if (oldConn.pool) await oldConn.pool.end().catch(() => {});
-      if (oldConn.adapter && oldConn.adapter.close) await oldConn.adapter.close().catch(() => {});
+      if (oldConn.pool) await Promise.resolve(oldConn.pool.end()).catch(() => {});
+      if (oldConn.adapter && typeof oldConn.adapter.close === 'function') {
+        await Promise.resolve(oldConn.adapter.close()).catch(() => {});
+      }
     }
 
     connections.set(key, connData);
@@ -997,6 +1007,75 @@ app.post('/api/database/search', requireAuth, getConnection, async (req, res) =>
   } catch (err) {
     console.error('Database Search Error:', err);
     res.status(500).json({ error: 'Pencarian database gagal: ' + err.message });
+  }
+});
+
+// ---------- SEED EXAMPLE DATABASE (PostgreSQL, MySQL, SQLite) ----------
+app.post('/api/database/seed-example', requireAuth, getConnection, async (req, res) => {
+  try {
+    const conn = req.conn;
+
+    if (conn.type === 'sqlite') {
+      const db = createDemoDB();
+      if (db && db.open) db.close();
+      conn.tables = conn.adapter.getTables();
+      return res.json({
+        success: true,
+        engine: 'SQLite',
+        tables: conn.tables,
+        message: 'Example Database SQLite berhasil di-generate beserta data contoh.',
+      });
+    }
+
+    if (conn.type === 'postgres' || conn.type === 'pg') {
+      const sqlPath = path.join(__dirname, '..', 'examples', 'postgres_example.sql');
+      if (!fs.existsSync(sqlPath)) {
+        return res.status(404).json({ error: 'File postgres_example.sql tidak ditemukan.' });
+      }
+      const sql = fs.readFileSync(sqlPath, 'utf8');
+      await conn.pool.query(sql);
+
+      const tablesResult = await conn.pool.query(`
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public' ORDER BY table_name
+      `);
+      conn.tables = tablesResult.rows.map(r => r.table_name);
+      return res.json({
+        success: true,
+        engine: 'PostgreSQL',
+        tables: conn.tables,
+        message: 'Example Database PostgreSQL berhasil di-generate beserta data contoh lengkap.',
+      });
+    }
+
+    if (conn.type === 'mysql') {
+      const sqlPath = path.join(__dirname, '..', 'examples', 'mysql_example.sql');
+      if (!fs.existsSync(sqlPath)) {
+        return res.status(404).json({ error: 'File mysql_example.sql tidak ditemukan.' });
+      }
+      const sql = fs.readFileSync(sqlPath, 'utf8');
+      // Pisahkan perintah query berdasarkan delimiter titik koma
+      const rawStatements = sql.split(/;\s*[\r\n]+/);
+      for (const raw of rawStatements) {
+        const stmt = raw.trim();
+        if (stmt && !stmt.startsWith('--') && !stmt.startsWith('/*')) {
+          await conn.pool.query(stmt);
+        }
+      }
+
+      conn.tables = await conn.adapter.getTables();
+      return res.json({
+        success: true,
+        engine: 'MySQL',
+        tables: conn.tables,
+        message: 'Example Database MySQL berhasil di-generate beserta data contoh lengkap.',
+      });
+    }
+
+    res.status(400).json({ error: `Tipe database "${conn.type}" tidak didukung untuk auto-seeding.` });
+  } catch (err) {
+    console.error('Seed Example Error:', err);
+    res.status(500).json({ error: 'Gagal membuat example database: ' + err.message });
   }
 });
 
@@ -1444,11 +1523,15 @@ app.post('/api/table/create', requireAuth, getConnection, async (req, res) => {
     return res.status(400).json({ error: 'tableName dan columns diperlukan' });
   }
   try {
+    const isMysql = req.conn.type === 'mysql';
+    const q = isMysql ? '`' : '"';
+
     const colDefs = columns.map(col => {
-      let def = `"${col.name}" ${col.type}`;
+      let def = `${q}${col.name}${q} ${col.type}`;
       if (col.primaryKey) def += ' PRIMARY KEY';
       if (col.autoIncrement) {
         if (req.conn.type === 'sqlite') def += ' AUTOINCREMENT';
+        else if (isMysql) def = `${q}${col.name}${q} INT AUTO_INCREMENT PRIMARY KEY`;
         else def = `"${col.name}" SERIAL PRIMARY KEY`;
       }
       if (col.notNull && !col.primaryKey) def += ' NOT NULL';
@@ -1457,11 +1540,11 @@ app.post('/api/table/create', requireAuth, getConnection, async (req, res) => {
       return def;
     });
 
-    const sql = `CREATE TABLE "${tableName}" (${colDefs.join(', ')})`;
+    const sql = `CREATE TABLE ${q}${tableName}${q} (${colDefs.join(', ')})`;
 
     if (req.conn.type === 'sqlite') {
       req.conn.adapter.db.exec(sql);
-      
+
       // Insert initial data if provided
       if (Array.isArray(initialData) && initialData.length > 0) {
         for (const row of initialData) {
@@ -1477,6 +1560,26 @@ app.post('/api/table/create', requireAuth, getConnection, async (req, res) => {
       }
 
       req.conn.tables = req.conn.adapter.getTables();
+      return res.json({ success: true, tables: req.conn.tables });
+    }
+
+    if (isMysql) {
+      await req.conn.pool.query(sql);
+
+      if (Array.isArray(initialData) && initialData.length > 0) {
+        for (const row of initialData) {
+          const keys = Object.keys(row).filter(k => row[k] !== '' && row[k] !== undefined);
+          if (keys.length > 0) {
+            const values = keys.map(k => row[k] === null || row[k] === 'NULL' ? null : row[k]);
+            const placeholders = keys.map(() => '?').join(', ');
+            const cols = keys.map(k => `\`${k}\``).join(', ');
+            const insertSql = `INSERT INTO \`${tableName}\` (${cols}) VALUES (${placeholders})`;
+            await req.conn.pool.query(insertSql, values);
+          }
+        }
+      }
+
+      req.conn.tables = await req.conn.adapter.getTables();
       return res.json({ success: true, tables: req.conn.tables });
     }
 
@@ -1667,7 +1770,6 @@ app.post('/api/disconnect', requireAuth, (req, res) => {
 });
 
 // ---------- SERVING FRONTEND FOR HOSTING (Production) ----------
-const fs = require('fs');
 const distPath = (() => {
   const candidates = [
     path.join(__dirname, '../frontend/dist'),

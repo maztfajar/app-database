@@ -33,83 +33,65 @@ async function logAudit(userId, action, details, req) {
 }
 
 // -----------------------------------------------------------------------------
-// REGISTER (Email & Password + Send Google/Email OTP)
+// REGISTER (Akun Lokal Langsung Aktif — Username/Email & Password)
 // -----------------------------------------------------------------------------
 router.post('/register', registerLimiter, async (req, res) => {
   const { name, email, password } = req.body;
 
   if (!name || !email || !password) {
-    return res.status(400).json({ error: 'Nama lengkap, email, dan password wajib diisi.' });
+    return res.status(400).json({ error: 'Nama lengkap, username/email, dan kata sandi wajib diisi.' });
   }
 
   const cleanEmail = String(email).trim().toLowerCase();
   const cleanName = String(name).trim();
 
-  // Basic email validation
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(cleanEmail)) {
-    return res.status(400).json({ error: 'Format alamat email tidak valid.' });
+  // Validasi username atau email sederhana (minimal 3 karakter, tanpa spasi)
+  if (cleanEmail.length < 3 || /\s/.test(cleanEmail)) {
+    return res.status(400).json({ error: 'Username atau email minimal 3 karakter dan tidak boleh mengandung spasi.' });
   }
 
-  // Password complexity check (minimum 8 characters, at least 1 letter and 1 number)
-  if (password.length < 8) {
-    return res.status(400).json({ error: 'Password minimal terdiri dari 8 karakter demi keamanan siber.' });
+  // Minimal 6 karakter untuk kenyamanan akun lokal
+  if (password.length < 6) {
+    return res.status(400).json({ error: 'Kata sandi minimal terdiri dari 6 karakter.' });
   }
 
   try {
     // Check if user already exists
-    const existing = await userDb.query('SELECT id, email, is_verified FROM users WHERE email = ?', [cleanEmail]);
+    const existing = await userDb.query('SELECT id, email FROM users WHERE email = ?', [cleanEmail]);
 
     if (existing.rows && existing.rows.length > 0) {
-      const user = existing.rows[0];
-      if (user.is_verified) {
-        return res.status(400).json({ error: 'Email ini sudah terdaftar. Silakan masuk menggunakan akun Anda.' });
-      }
-
-      // User exists but hasn't verified yet -> Generate fresh OTP and resend
-      const otp = generateOTP();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-      const passwordHash = await hashPassword(password);
-
-      await userDb.query(
-        'UPDATE users SET name = ?, password_hash = ?, verification_code = ?, verification_code_expires_at = ?, verification_attempts = 0 WHERE id = ?',
-        [cleanName, passwordHash, otp, expiresAt, user.id]
-      );
-
-      const mailResult = await sendVerificationEmail(cleanEmail, cleanName, otp);
-      await logAudit(user.id, 'REGISTER_RESEND_OTP', 'User mendaftar ulang akun yang belum terverifikasi', req);
-
-      return res.json({
-        success: true,
-        needsVerification: true,
-        email: cleanEmail,
-        message: `Kode verifikasi telah dikirim ke ${cleanEmail}. Silakan periksa kotak masuk atau spam email Anda.`,
-        devOtp: isDev && mailResult.simulated ? otp : undefined,
-      });
+      return res.status(400).json({ error: 'Username atau email ini sudah terdaftar. Silakan masuk menggunakan akun Anda.' });
     }
 
-    // New user registration
+    // Create local account directly (langsung aktif tanpa verifikasi OTP / Google)
     const passwordHash = await hashPassword(password);
-    const otp = generateOTP();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const nowIso = new Date().toISOString();
 
     const insertResult = await userDb.query(
-      `INSERT INTO users (name, email, password_hash, auth_provider, is_verified, verification_code, verification_code_expires_at, verification_attempts)
-       VALUES (?, ?, ?, 'local', 0, ?, ?, 0)`,
-      [cleanName, cleanEmail, passwordHash, otp, expiresAt]
+      `INSERT INTO users (name, email, password_hash, auth_provider, is_verified, last_login_at)
+       VALUES (?, ?, ?, 'local', 1, ?)`,
+      [cleanName, cleanEmail, passwordHash, nowIso]
     );
 
     const newUserId = insertResult.insertId;
-    const mailResult = await sendVerificationEmail(cleanEmail, cleanName, otp);
+    await logAudit(newUserId, 'REGISTER', `Pendaftaran akun lokal baru untuk ${cleanEmail}`, req);
 
-    await logAudit(newUserId, 'REGISTER', `Pendaftaran akun baru untuk ${cleanEmail}`, req);
+    const newUser = {
+      id: newUserId,
+      name: cleanName,
+      email: cleanEmail,
+      auth_provider: 'local',
+      is_verified: true,
+    };
+
+    const token = generateToken(newUser);
 
     return res.json({
       success: true,
-      needsVerification: true,
-      email: cleanEmail,
-      message: `Kode verifikasi 6 digit telah dikirim ke ${cleanEmail}.`,
-      devOtp: isDev && mailResult.simulated ? otp : undefined,
+      needsVerification: false,
+      message: `Akun lokal "${cleanName}" berhasil dibuat!`,
+      token,
+      user: newUser,
     });
   } catch (err) {
     console.error('Register Error:', err);
@@ -386,34 +368,96 @@ router.post('/reset-password', otpVerifyLimiter, async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// LOGIN (Email & Password)
+// RESET PASSWORD LOKAL (Langsung atur ulang sandi tanpa OTP email eksternal)
 // -----------------------------------------------------------------------------
-router.post('/login', loginLimiter, async (req, res) => {
-  const { email, password } = req.body;
+router.post('/reset-password-local', loginLimiter, async (req, res) => {
+  const { email, newPassword } = req.body;
 
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email dan kata sandi wajib diisi.' });
+  if (!email || !newPassword) {
+    return res.status(400).json({ error: 'Username/email dan kata sandi baru wajib diisi.' });
+  }
+
+  if (newPassword.length < 6) {
+    return res.status(400).json({ error: 'Kata sandi baru minimal terdiri dari 6 karakter.' });
   }
 
   const cleanEmail = String(email).trim().toLowerCase();
 
   try {
-    const result = await userDb.query(
+    let result = await userDb.query(
+      'SELECT id, name, email FROM users WHERE email = ?',
+      [cleanEmail]
+    );
+
+    if ((!result.rows || result.rows.length === 0) && !cleanEmail.includes('@')) {
+      result = await userDb.query(
+        'SELECT id, name, email FROM users WHERE email = ?',
+        [`${cleanEmail}@local`]
+      );
+    }
+
+    if (!result.rows || result.rows.length === 0) {
+      return res.status(404).json({ error: 'Akun lokal dengan username/email tersebut tidak ditemukan.' });
+    }
+
+    const user = result.rows[0];
+    const passwordHash = await hashPassword(newPassword);
+    const nowIso = new Date().toISOString();
+
+    await userDb.query(
+      "UPDATE users SET password_hash = ?, auth_provider = 'local', is_verified = 1, verification_code = NULL, verification_attempts = 0, updated_at = ? WHERE id = ?",
+      [passwordHash, nowIso, user.id]
+    );
+
+    await logAudit(user.id, 'PASSWORD_RESET_LOCAL', 'Kata sandi akun lokal diatur ulang secara langsung', req);
+
+    return res.json({
+      success: true,
+      message: 'Kata sandi akun lokal berhasil diperbarui! Silakan masuk menggunakan kata sandi baru Anda.',
+    });
+  } catch (err) {
+    console.error('Local reset password error:', err);
+    return res.status(500).json({ error: 'Gagal mengatur ulang kata sandi.' });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// LOGIN (Akun Lokal — Username/Email & Password)
+// -----------------------------------------------------------------------------
+router.post('/login', loginLimiter, async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Username/email dan kata sandi wajib diisi.' });
+  }
+
+  const cleanEmail = String(email).trim().toLowerCase();
+
+  try {
+    let result = await userDb.query(
       'SELECT id, name, email, password_hash, avatar_url, auth_provider, is_verified FROM users WHERE email = ?',
       [cleanEmail]
     );
 
+    // Dukung shortcut username tanpa @local (misal ketik "admin" untuk "admin@local")
+    if ((!result.rows || result.rows.length === 0) && !cleanEmail.includes('@')) {
+      result = await userDb.query(
+        'SELECT id, name, email, password_hash, avatar_url, auth_provider, is_verified FROM users WHERE email = ?',
+        [`${cleanEmail}@local`]
+      );
+    }
+
     if (!result.rows || result.rows.length === 0) {
-      await logAudit(null, 'LOGIN_FAILED', `Upaya login email tidak terdaftar: ${cleanEmail}`, req);
-      return res.status(401).json({ error: 'Email atau kata sandi yang Anda masukkan salah.' });
+      await logAudit(null, 'LOGIN_FAILED', `Upaya login akun tidak terdaftar: ${cleanEmail}`, req);
+      return res.status(401).json({ error: 'Username/email atau kata sandi yang Anda masukkan salah.' });
     }
 
     const user = result.rows[0];
 
-    // If registered via Google and has no local password
-    if (user.auth_provider === 'google' && !user.password_hash) {
+    // Jika akun lama sebelumnya dibuat tanpa password lokal
+    if (!user.password_hash) {
       return res.status(400).json({
-        error: 'Akun ini terdaftar menggunakan Google. Silakan klik tombol "Masuk dengan Google".',
+        error: 'Akun lama ini belum memiliki kata sandi lokal. Silakan klik "Reset Kata Sandi?" untuk mengatur kata sandi lokal Anda.',
       });
     }
 
@@ -421,34 +465,15 @@ router.post('/login', loginLimiter, async (req, res) => {
     const isValid = await comparePassword(password, user.password_hash);
     if (!isValid) {
       await logAudit(user.id, 'LOGIN_FAILED', 'Kata sandi salah', req);
-      return res.status(401).json({ error: 'Email atau kata sandi yang Anda masukkan salah.' });
+      return res.status(401).json({ error: 'Username/email atau kata sandi yang Anda masukkan salah.' });
     }
 
-    // Check if account is verified
-    if (!user.is_verified) {
-      // Send fresh OTP so user can verify immediately
-      const newOtp = generateOTP();
-      const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-      await userDb.query(
-        'UPDATE users SET verification_code = ?, verification_code_expires_at = ?, verification_attempts = 0 WHERE id = ?',
-        [newOtp, expiresAt, user.id]
-      );
-      const mailResult = await sendVerificationEmail(cleanEmail, user.name, newOtp);
-
-      return res.status(403).json({
-        error: 'Akun Anda belum diverifikasi. Kode verifikasi baru telah dikirim ke email Google Anda.',
-        needsVerification: true,
-        email: cleanEmail,
-        devOtp: isDev && mailResult.simulated ? newOtp : undefined,
-      });
-    }
-
-    // Login successful
+    // Login successful (langsung aktif untuk akun lokal)
     const nowIso = new Date().toISOString();
-    await userDb.query('UPDATE users SET last_login_at = ? WHERE id = ?', [nowIso, user.id]);
-    await logAudit(user.id, 'LOGIN_SUCCESS', 'Login berhasil via email & password', req);
+    await userDb.query('UPDATE users SET is_verified = 1, last_login_at = ? WHERE id = ?', [nowIso, user.id]);
+    await logAudit(user.id, 'LOGIN_SUCCESS', 'Login akun lokal berhasil', req);
 
-    const token = generateToken(user);
+    const token = generateToken({ ...user, is_verified: true });
 
     return res.json({
       success: true,
@@ -459,7 +484,7 @@ router.post('/login', loginLimiter, async (req, res) => {
         name: user.name,
         email: user.email,
         avatar_url: user.avatar_url,
-        auth_provider: user.auth_provider,
+        auth_provider: 'local',
         is_verified: true,
       },
     });

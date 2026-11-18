@@ -122,14 +122,12 @@ export default function SecurityModal({ visible, onClose, user }) {
         {/* Account Details */}
         <Descriptions size="small" bordered column={2} style={{ marginBottom: 16 }}>
           <Descriptions.Item label="Nama Akun">{user?.name}</Descriptions.Item>
-          <Descriptions.Item label="Email Terdaftar">{user?.email}</Descriptions.Item>
+          <Descriptions.Item label="Username / Email">{user?.email}</Descriptions.Item>
           <Descriptions.Item label="Metode Autentikasi">
-            <Tag color={user?.auth_provider === 'google' ? 'blue' : 'purple'}>
-              {user?.auth_provider === 'google' ? 'Google Account' : 'Email & Password (OTP)'}
-            </Tag>
+            <Tag color="purple">Akun Lokal (Username &amp; Sandi)</Tag>
           </Descriptions.Item>
           <Descriptions.Item label="Status Akun">
-            <Tag color="success" icon={<CheckCircleOutlined />}>Terverifikasi &amp; Aman</Tag>
+            <Tag color="success" icon={<CheckCircleOutlined />}>Aktif &amp; Aman</Tag>
           </Descriptions.Item>
         </Descriptions>
 

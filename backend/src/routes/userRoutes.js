@@ -17,43 +17,11 @@ router.use(requireAuth);
  */
 router.get('/connections', async (req, res) => {
   try {
-    let result = await userDb.query(
+    const result = await userDb.query(
       `SELECT id, name, type, host, port, database_name, username, connection_string, ssl, created_at, updated_at
        FROM user_connections WHERE user_id = ? ORDER BY id DESC`,
       [req.user.id]
     );
-
-    // Otomatis buatkan slot database pribadi jika akun baru belum memiliki slot
-    if (!result.rows || result.rows.length === 0) {
-      const nowIso = new Date().toISOString();
-      const userFirstName = req.user.name ? req.user.name.trim().split(' ')[0] : 'Akun';
-      const slotName = `Slot Database Pribadi (${userFirstName})`;
-
-      await userDb.query(
-        `INSERT INTO user_connections (user_id, name, type, host, port, database_name, username, encrypted_password, connection_string, ssl, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          req.user.id,
-          slotName,
-          'sqlite',
-          'localhost',
-          3001,
-          `user_${req.user.id}_db`,
-          'admin',
-          null,
-          null,
-          0,
-          nowIso,
-          nowIso,
-        ]
-      );
-
-      result = await userDb.query(
-        `SELECT id, name, type, host, port, database_name, username, connection_string, ssl, created_at, updated_at
-         FROM user_connections WHERE user_id = ? ORDER BY id DESC`,
-        [req.user.id]
-      );
-    }
 
     res.json({
       success: true,

@@ -411,6 +411,7 @@ async function initUserDatabase() {
       currentDbType = 'postgres';
       console.log('✅ Berhasil terhubung ke database pengguna PostgreSQL / Supabase!');
       await createPostgresTables(pool);
+      await ensureDefaultLocalAccount();
       return;
     } else {
       console.warn('⚠️ Gagal terhubung ke PostgreSQL/Supabase (' + (lastErr ? lastErr.message : 'Unknown error') + '). Beralih ke penyimpanan lokal otomatis.');
@@ -445,6 +446,7 @@ async function initUserDatabase() {
       currentDbType = 'mysql';
       console.log('✅ Berhasil terhubung ke database pengguna MySQL!');
       await createMysqlTables(pool);
+      await ensureDefaultLocalAccount();
       return;
     } catch (err) {
       console.warn('⚠️ Gagal terhubung ke MySQL pengguna (' + err.message + '). Beralih ke penyimpanan lokal otomatis.');
@@ -463,6 +465,7 @@ async function initUserDatabase() {
       currentDbType = 'sqlite';
       console.log(`📁 Menggunakan database pengguna SQLite lokal otomatis (${sqlitePath})`);
       createSqliteTables(sqlite);
+      await ensureDefaultLocalAccount();
       return;
     } catch (err) {
       console.warn('⚠️ Gagal menginisialisasi SQLite native (' + err.message + '). Beralih ke penyimpanan file JSON.');
@@ -480,9 +483,33 @@ async function initUserDatabase() {
     currentDbType = 'file';
     console.log(`📁 Menggunakan database file pengguna lokal otomatis (${jsonPath})`);
     console.log('✅ Seluruh skema tabel lokal siap digunakan.');
+    await ensureDefaultLocalAccount();
   } catch (err) {
     console.error('❌ Gagal menginisialisasi penyimpanan database lokal:', err.message);
     dbClient = null;
+  }
+}
+
+/**
+ * Ensure a default local account (admin@local / admin123) exists so users can log in locally immediately
+ */
+async function ensureDefaultLocalAccount() {
+  try {
+    const { hashPassword } = require('../utils/security');
+    const defaultEmail = 'admin@local';
+    const existing = await query('SELECT id, email FROM users WHERE email = ?', [defaultEmail]);
+    if (!existing.rows || existing.rows.length === 0) {
+      const passwordHash = await hashPassword('admin123');
+      const nowIso = new Date().toISOString();
+      await query(
+        `INSERT INTO users (name, email, password_hash, auth_provider, is_verified, created_at, updated_at)
+         VALUES (?, ?, ?, 'local', 1, ?, ?)`,
+        ['Admin Lokal', defaultEmail, passwordHash, nowIso, nowIso]
+      );
+      console.log('👤 Akun lokal default siap digunakan: admin@local (atau admin) / admin123');
+    }
+  } catch (err) {
+    console.warn('⚠️ Gagal mengecek akun lokal default:', err.message);
   }
 }
 
